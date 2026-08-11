@@ -1,5 +1,3 @@
-__Current State:__ The app is showing "No database open" because you haven't initialized or opened a database yet.
-
 ### Step 1: Initialize a New Database
 
 1. In the __Database Path__ field, enter a path like `C:\Users\ADMIN\Downloads\nem\my-database.vdb`
