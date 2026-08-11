@@ -1,0 +1,30 @@
+[package]
+name = "veildb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+sync-cloud = ["veildb-sync/cloud"]
+sync-p2p = ["veildb-sync/p2p"]
+
+[dependencies]
+veildb-storage = { path = "../storage" }
+veildb-crypto = { path = "../crypto" }
+veildb-integrity = { path = "../integrity" }
+veildb-query = { path = "../query" }
+veildb-access = { path = "../access" }
+veildb-sync = { path = "../sync" }
+blake3.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

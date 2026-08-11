@@ -1,0 +1,25 @@
+[package]
+name = "veildb-bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "veildb_bindings"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "veildb-bindings"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+veildb-core = { path = "../crates/core" }
+tauri.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

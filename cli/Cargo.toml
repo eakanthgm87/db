@@ -1,0 +1,18 @@
+[package]
+name = "veildb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "veildb"
+path = "src/main.rs"
+
+[dependencies]
+veildb-core = { path = "../crates/core" }
+clap.workspace = true
+anyhow.workspace = true
+rpassword.workspace = true
+tokio.workspace = true

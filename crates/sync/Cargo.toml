@@ -1,0 +1,27 @@
+[package]
+name = "veildb-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+cloud = []
+p2p = []
+
+[dependencies]
+veildb-storage = { path = "../storage" }
+veildb-crypto = { path = "../crypto" }
+veildb-integrity = { path = "../integrity" }
+blake3.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+proptest.workspace = true

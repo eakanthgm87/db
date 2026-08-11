@@ -1,0 +1,22 @@
+[package]
+name = "veildb-access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veildb-storage = { path = "../storage" }
+veildb-crypto = { path = "../crypto" }
+veildb-integrity = { path = "../integrity" }
+blake3.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

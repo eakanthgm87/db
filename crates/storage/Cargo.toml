@@ -1,0 +1,18 @@
+[package]
+name = "veildb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

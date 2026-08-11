@@ -1,0 +1,553 @@
+//! VeilDB Tauri bindings.
+//!
+//! Tauri commands that map 1:1 to `core` methods. Depends only on
+//! `core`. No direct storage/crypto/sync access.
+//!
+//! All errors crossing the Tauri boundary are serializable (`CoreError`
+//! → JSON). Never expose private/master keys, raw key material,
+//! SQLite connections, or internal storage structures across IPC.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{Manager, State};
+use veildb_core::{IntegrityStatus, LogicalClock, SecretString, SyncBackendKind, VeilDbCore};
+
+/// The shared application state holding the core instance.
+pub struct AppState {
+    /// The core instance (protected by a mutex for thread safety).
+    core: Mutex<Option<VeilDbCore>>,
+    /// The database path.
+    db_path: Mutex<Option<PathBuf>>,
+}
+
+impl AppState {
+    /// Create a new empty app state.
+    pub fn new() -> Self {
+        Self {
+            core: Mutex::new(None),
+            db_path: Mutex::new(None),
+        }
+    }
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A serializable error response for the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    /// The error message.
+    pub message: String,
+    /// The error code.
+    pub code: Option<i32>,
+    /// Whether this is an integrity/tamper error.
+    pub is_integrity: bool,
+}
+
+impl From<veildb_core::error::CoreError> for ApiError {
+    fn from(e: veildb_core::error::CoreError) -> Self {
+        let msg = e.to_string();
+        let is_integrity = msg.contains("integrity") || msg.contains("tamper");
+        Self {
+            message: msg,
+            code: None,
+            is_integrity,
+        }
+    }
+}
+
+/// A successful response wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiResponse<T> {
+    /// Whether the operation succeeded.
+    pub success: bool,
+    /// The result data (if success).
+    pub data: Option<T>,
+    /// The error (if failure).
+    pub error: Option<ApiError>,
+}
+
+impl<T> ApiResponse<T> {
+    /// Create a success response.
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn err(e: impl Into<ApiError>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(e.into()),
+        }
+    }
+}
+
+// Command module to avoid macro scoping issues
+#[allow(dead_code)]
+mod commands {
+    use super::*;
+
+    #[tauri::command]
+    pub fn vdb_init(
+        state: State<'_, AppState>,
+        path: String,
+        passphrase: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let path_buf = PathBuf::from(&path);
+        if path_buf.exists() {
+            return ApiResponse::err(ApiError {
+                message: "Database already exists".to_string(),
+                code: Some(1),
+                is_integrity: false,
+            });
+        }
+
+        let secret = SecretString::new(passphrase);
+        match VeilDbCore::init(&path_buf, secret) {
+            Ok(core) => {
+                let status = match core.status() {
+                    Ok(s) => s,
+                    Err(e) => return ApiResponse::err(ApiError::from(e)),
+                };
+                let mut guard = state.core.lock().unwrap();
+                *guard = Some(core);
+                *state.db_path.lock().unwrap() = Some(path_buf);
+                ApiResponse::ok(serde_json::json!({
+                    "db_id": hex(&status.db_id),
+                    "device_id": hex(&status.self_device_id),
+                    "key_version": status.key_version,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_open(
+        state: State<'_, AppState>,
+        path: String,
+        passphrase: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let path_buf = PathBuf::from(&path);
+        if !path_buf.exists() {
+            return ApiResponse::err(ApiError {
+                message: format!("Database not found: {}", path),
+                code: Some(1),
+                is_integrity: false,
+            });
+        }
+
+        let secret = SecretString::new(passphrase);
+        match VeilDbCore::init(&path_buf, secret) {
+            Ok(core) => {
+                let status = match core.status() {
+                    Ok(s) => s,
+                    Err(e) => return ApiResponse::err(ApiError::from(e)),
+                };
+                let mut guard = state.core.lock().unwrap();
+                *guard = Some(core);
+                *state.db_path.lock().unwrap() = Some(path_buf);
+                ApiResponse::ok(serde_json::json!({
+                    "db_id": hex(&status.db_id),
+                    "device_id": hex(&status.self_device_id),
+                    "key_version": status.key_version,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_close(state: State<'_, AppState>) -> ApiResponse<()> {
+        let mut guard = state.core.lock().unwrap();
+        *guard = None;
+        *state.db_path.lock().unwrap() = None;
+        ApiResponse::ok(())
+    }
+
+    #[tauri::command]
+    pub fn vdb_put(
+        state: State<'_, AppState>,
+        key: String,
+        value: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.put(&key, value.as_bytes()) {
+            Ok(op_id) => ApiResponse::ok(serde_json::json!({
+                "device_id": hex(&op_id.device_id),
+                "sequence": op_id.sequence,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_get(state: State<'_, AppState>, key: String) -> ApiResponse<String> {
+        let guard = state.core.lock().unwrap();
+        let core = guard.as_ref();
+        let core = match core {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.get(&key) {
+            Ok(value) => ApiResponse::ok(String::from_utf8_lossy(&value).to_string()),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_status(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.status() {
+            Ok(status) => ApiResponse::ok(serde_json::json!({
+                "db_id": hex(&status.db_id),
+                "operation_count": status.operation_count,
+                "merkle_root": hex(&status.merkle_root),
+                "logical_clock": status.logical_clock.entries
+                    .iter().map(|(d, c)| format!("{}:{}", hex(d), c))
+                    .collect::<Vec<_>>(),
+                "latest_snapshot_id": status.latest_snapshot_id,
+                "snapshot_merkle_root": status.snapshot_merkle_root.map(|r| hex(&r)),
+                "device_count": status.device_count,
+                "self_device_id": hex(&status.self_device_id),
+                "self_public_key": hex(&status.self_public_key),
+                "key_version": status.key_version,
+                "format_version": status.format_version,
+                "bootstrapped": status.bootstrapped,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_verify(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.verify_integrity() {
+            Ok(status) => {
+                let (label, is_ok) = match status {
+                    IntegrityStatus::Verified => ("VERIFIED", true),
+                    IntegrityStatus::Tampered => ("TAMPERED", false),
+                    IntegrityStatus::Unverified => ("UNVERIFIED", false),
+                };
+                ApiResponse::ok(serde_json::json!({
+                    "status": label,
+                    "verified": is_ok,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_query_at(
+        state: State<'_, AppState>,
+        clock: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let clock = match parse_clock(&clock) {
+            Ok(c) => c,
+            Err(e) => return ApiResponse::err(ApiError {
+                message: e,
+                code: None,
+                is_integrity: false,
+            }),
+        };
+        match core.query_at(clock) {
+            Ok(state) => {
+                let entries: Vec<serde_json::Value> = state
+                    .entries
+                    .iter()
+                    .map(|(k, v)| {
+                        serde_json::json!({
+                            "key": k,
+                            "value": String::from_utf8_lossy(v),
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok(serde_json::json!({
+                    "clock": state.clock.entries
+                        .iter().map(|(d, c)| format!("{}:{}", hex(d), c))
+                        .collect::<Vec<_>>(),
+                    "entries": entries,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_log(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.log(None) {
+            Ok(log) => {
+                let entries: Vec<serde_json::Value> = log
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "sequence": e.id.sequence,
+                            "device_id": hex(&e.device_id),
+                            "hash": hex(&e.hash),
+                            "parent_count": e.parent_count,
+                            "clock": e.clock.entries
+                                .iter().map(|(d, c)| format!("{}:{}", hex(d), c))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok(serde_json::json!({ "operations": entries }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_list_devices(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.list_devices() {
+            Ok(devices) => {
+                let entries: Vec<serde_json::Value> = devices
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "device_id": hex(&d.device_id),
+                            "public_key": hex(&d.public_key),
+                            "trusted": d.trusted,
+                            "approved_by": d.approved_by.map(|a| hex(&a)),
+                            "created_at": d.created_at,
+                        })
+                    })
+                    .collect();
+                ApiResponse::ok(serde_json::json!({ "devices": entries }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_trust_device(
+        state: State<'_, AppState>,
+        public_key: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let pk = match parse_hex(&public_key) {
+            Ok(p) => p.to_vec(),
+            Err(e) => return ApiResponse::err(ApiError {
+                message: e,
+                code: None,
+                is_integrity: false,
+            }),
+        };
+        match core_ref.trust_device(&pk) {
+            Ok(entry) => ApiResponse::ok(serde_json::json!({
+                "device_id": hex(&entry.device_id),
+                "trusted": entry.trusted,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_revoke_device(
+        state: State<'_, AppState>,
+        device_id: String,
+    ) -> ApiResponse<()> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let id = match parse_hex(&device_id) {
+            Ok(p) => p.to_vec(),
+            Err(e) => return ApiResponse::err(ApiError {
+                message: e,
+                code: None,
+                is_integrity: false,
+            }),
+        };
+        match core_ref.revoke_device(&id) {
+            Ok(()) => ApiResponse::ok(()),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_backup(state: State<'_, AppState>, output: String) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.backup(&PathBuf::from(&output)) {
+            Ok(archive) => ApiResponse::ok(serde_json::json!({
+                "format_version": archive.format_version,
+                "db_id": hex(&archive.db_id),
+                "merkle_root": hex(&archive.merkle_root),
+                "path": output,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_restore(state: State<'_, AppState>, archive: String) -> ApiResponse<()> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.restore(&PathBuf::from(&archive)) {
+            Ok(()) => ApiResponse::ok(()),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_snapshot(state: State<'_, AppState>) -> ApiResponse<i64> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.snapshot() {
+            Ok(id) => ApiResponse::ok(id),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_sync_lan(
+        state: State<'_, AppState>,
+        addr: String,
+    ) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let backend = SyncBackendKind::Lan { addr };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(core_ref.sync(backend)) {
+            Ok(report) => ApiResponse::ok(serde_json::json!({
+                "operations_received": report.operations_received,
+                "operations_sent": report.operations_sent,
+                "operations_merged": report.operations_merged,
+                "merkle_root": hex(&report.merkle_root),
+                "success": report.success,
+                "message": report.message,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+}
+
+use commands::*;
+
+fn not_initialized() -> ApiError {
+    ApiError {
+        message: "Database not initialized or opened".to_string(),
+        code: Some(1),
+        is_integrity: false,
+    }
+}
+
+fn parse_hex(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!("Expected 64 hex chars, got {}", s.len()));
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("Invalid hex: {e}"))?;
+    }
+    Ok(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_clock(s: &str) -> Result<LogicalClock, String> {
+    let mut clock = LogicalClock::new();
+    for part in s.split(',') {
+        let (device, counter) = part
+            .split_once(':')
+            .ok_or_else(|| format!("Invalid clock format: {part}"))?;
+        let device_bytes = parse_hex(device)?;
+        let counter: u64 = counter.parse().map_err(|e| format!("Invalid counter: {e}"))?;
+        clock.entries.push((device_bytes, counter));
+    }
+    clock.entries.sort();
+    Ok(clock)
+}
+
+/// Setup the Tauri plugin.
+pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    app.manage(AppState::new());
+    Ok(())
+}
+
+/// Register all Tauri commands.
+pub fn run() {
+    tauri::Builder::default()
+        .setup(setup)
+        .invoke_handler(tauri::generate_handler![
+            vdb_init,
+            vdb_open,
+            vdb_close,
+            vdb_put,
+            vdb_get,
+            vdb_status,
+            vdb_verify,
+            vdb_query_at,
+            vdb_log,
+            vdb_list_devices,
+            vdb_trust_device,
+            vdb_revoke_device,
+            vdb_backup,
+            vdb_restore,
+            vdb_snapshot,
+            vdb_sync_lan,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

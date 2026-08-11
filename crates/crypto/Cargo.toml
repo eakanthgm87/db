@@ -1,0 +1,23 @@
+[package]
+name = "veildb-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+argon2.workspace = true
+rand_core.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

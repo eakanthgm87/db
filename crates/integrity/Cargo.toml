@@ -1,0 +1,17 @@
+[package]
+name = "veildb-integrity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veildb-storage = { path = "../storage" }
+blake3.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
