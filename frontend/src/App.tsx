@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { api } from "./mockApi";
+import { open } from "@tauri-apps/plugin-dialog";
+import UserDemo from "./UserDemo";
 import type { DbStatus, DeviceInfo, OperationSummary } from "./types";
 
 type Tab =
@@ -11,7 +13,8 @@ type Tab =
   | "keys"
   | "graph"
   | "merkle"
-  | "tamper";
+  | "tamper"
+  | "users";
 
 interface IntegrityResult {
   status: string;
@@ -77,6 +80,9 @@ function App() {
   const [integrity, setIntegrity] = useState<IntegrityResult | null>(null);
   const [syncLog, setSyncLog] = useState<string[]>([]);
   const [syncing, setSyncing] = useState(false);
+
+  // Sync peer address.
+  const [syncAddr, setSyncAddr] = useState("127.0.0.1:8443");
 
   // Developer mode toggle (React state only, not persisted).
   const [devMode, setDevMode] = useState(false);
@@ -379,8 +385,13 @@ function App() {
     setError(null);
     setSyncing(true);
     setSyncLog([]);
+    if (!syncAddr.trim()) {
+      setError("Enter a peer address (e.g. 127.0.0.1:8443)");
+      setSyncing(false);
+      return;
+    }
     try {
-      const result = await api.syncLan("127.0.0.1:8443");
+      const result = await api.syncLan(syncAddr.trim());
       if (result.success && result.data) {
         setSyncLog([
           `Sync completed: ${result.data.message}`,
@@ -393,10 +404,20 @@ function App() {
         refreshDag();
         refreshMerkle();
       } else {
-        setError(result.error?.message || "Sync failed");
+        const msg = result.error?.message || "Sync failed";
+        if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
+          setError(`Could not connect to peer at ${syncAddr}. Make sure a VeilDB sync server is running on that address.`);
+        } else {
+          setError(msg);
+        }
       }
     } catch (e: any) {
-      setError(e.message || String(e));
+      const msg = e.message || String(e);
+      if (msg.includes("refused") || msg.includes("10061") || msg.includes("connection")) {
+        setError(`Could not connect to peer at ${syncAddr}. Make sure a VeilDB sync server is running on that address.`);
+      } else {
+        setError(msg);
+      }
     } finally {
       setSyncing(false);
     }
@@ -471,23 +492,59 @@ function App() {
 
   // File picker for DB path.
   async function pickDbPath() {
-    const selected = prompt("Enter database path:", dbPath || "veildb.vdb");
-    if (selected) {
-      setDbPath(selected);
+    try {
+      const selected = await open({
+        defaultPath: dbPath || undefined,
+        directory: true,
+        multiple: false,
+        title: "Select database folder",
+      });
+      if (selected && typeof selected === "string") {
+        // Append default filename to the selected directory
+        const sep = selected.includes("/") ? "/" : "\\";
+        setDbPath(selected + sep + "veildb.vdb");
+      }
+    } catch {
+      const selected = prompt("Enter database path:", dbPath || "veildb.vdb");
+      if (selected) {
+        setDbPath(selected);
+      }
     }
   }
 
   async function pickBackupPath() {
-    const selected = prompt("Enter backup path:", "backup.vdb");
-    if (selected) {
-      setBackupPath(selected);
+    try {
+      const selected = await open({
+        defaultPath: backupPath || undefined,
+        directory: false,
+        multiple: false,
+      });
+      if (selected && typeof selected === "string") {
+        setBackupPath(selected);
+      }
+    } catch {
+      const selected = prompt("Enter backup path:", "backup.vdb");
+      if (selected) {
+        setBackupPath(selected);
+      }
     }
   }
 
   async function pickRestorePath() {
-    const selected = prompt("Enter restore path:", "backup.vdb");
-    if (selected) {
-      setRestorePath(selected);
+    try {
+      const selected = await open({
+        defaultPath: restorePath || undefined,
+        directory: false,
+        multiple: false,
+      });
+      if (selected && typeof selected === "string") {
+        setRestorePath(selected);
+      }
+    } catch {
+      const selected = prompt("Enter restore path:", "backup.vdb");
+      if (selected) {
+        setRestorePath(selected);
+      }
     }
   }
 
@@ -502,6 +559,12 @@ function App() {
         </div>
         {status && (
           <div className="flex items-center gap-3">
+            <a
+              href="#demo"
+              className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded"
+            >
+              Demo Site →
+            </a>
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -642,6 +705,12 @@ function App() {
                     <span className="text-red-400">Tamper Test</span>
                   </TabButton>
                 )}
+                <TabButton
+                  active={activeTab === "users"}
+                  onClick={() => setActiveTab("users")}
+                >
+                  User Demo
+                </TabButton>
               </div>
             </>
           )}
@@ -701,6 +770,8 @@ function App() {
                 <Sync
                   syncing={syncing}
                   syncLog={syncLog}
+                  syncAddr={syncAddr}
+                  onSyncAddrChange={setSyncAddr}
                   onSync={handleSync}
                   onViewGraph={() => setActiveTab("graph")}
                 />
@@ -753,6 +824,9 @@ function App() {
                   integrity={integrity}
                 />
               )}
+              {activeTab === "users" && (
+                <UserDemo />
+              )}
             </>
           )}
         </main>
@@ -773,11 +847,10 @@ function TabButton({
   return (
     <button
       onClick={onClick}
-      className={`w-full text-left px-3 py-2 rounded text-sm ${
-        active
+      className={`w-full text-left px-3 py-2 rounded text-sm ${active
           ? "bg-primary-700 text-white"
           : "text-slate-300 hover:bg-dark-700"
-      }`}
+        }`}
     >
       {children}
     </button>
@@ -829,11 +902,10 @@ function Dashboard({
         {integrity ? (
           <div className="flex items-center gap-3">
             <span
-              className={`inline-block px-2 py-1 rounded text-sm cursor-pointer ${
-                integrity.verified
+              className={`inline-block px-2 py-1 rounded text-sm cursor-pointer ${integrity.verified
                   ? "bg-green-900 text-green-200"
                   : "bg-red-900 text-red-200"
-              }`}
+                }`}
               onClick={onViewMerkle}
               title="Click to view Merkle tree"
             >
@@ -1059,11 +1131,15 @@ function Devices({
 function Sync({
   syncing,
   syncLog,
+  syncAddr,
+  onSyncAddrChange,
   onSync,
   onViewGraph,
 }: {
   syncing: boolean;
   syncLog: string[];
+  syncAddr: string;
+  onSyncAddrChange: (v: string) => void;
   onSync: () => void;
   onViewGraph: () => void;
 }) {
@@ -1073,19 +1149,33 @@ function Sync({
 
       <div className="bg-dark-800 border border-slate-700 rounded p-4">
         <h3 className="text-lg font-medium mb-3">LAN Sync</h3>
-        <button
-          onClick={onSync}
-          disabled={syncing}
-          className="w-full bg-primary-600 hover:bg-primary-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-sm"
-        >
-          {syncing ? "Syncing..." : "Sync with LAN peer"}
-        </button>
-        <button
-          onClick={onViewGraph}
-          className="mt-2 w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm"
-        >
-          View Operation Graph
-        </button>
+        <div className="space-y-2">
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Peer Address
+            </label>
+            <input
+              type="text"
+              value={syncAddr}
+              onChange={(e) => onSyncAddrChange(e.target.value)}
+              placeholder="127.0.0.1:8443"
+              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm font-mono"
+            />
+          </div>
+          <button
+            onClick={onSync}
+            disabled={syncing}
+            className="w-full bg-primary-600 hover:bg-primary-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-sm"
+          >
+            {syncing ? "Syncing..." : "Sync with LAN peer"}
+          </button>
+          <button
+            onClick={onViewGraph}
+            className="w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm"
+          >
+            View Operation Graph
+          </button>
+        </div>
       </div>
 
       {syncLog.length > 0 && (
@@ -1298,11 +1388,10 @@ function OperationGraph({
                         <div
                           key={n.hash}
                           onClick={() => onSelectNode(n)}
-                          className={`cursor-pointer rounded border p-2 min-w-[100px] text-center ${
-                            isTampered
+                          className={`cursor-pointer rounded border p-2 min-w-[100px] text-center ${isTampered
                               ? "bg-red-900 border-red-600 text-red-200"
                               : "bg-dark-900 border-slate-600"
-                          }`}
+                            }`}
                           style={{
                             borderLeft: `4px solid ${deviceColor(device)}`,
                           }}
@@ -1429,11 +1518,10 @@ function MerkleView({
                   return (
                     <div
                       key={n.id}
-                      className={`rounded border px-2 py-1 text-center ${
-                        isTampered
+                      className={`rounded border px-2 py-1 text-center ${isTampered
                           ? "bg-red-900 border-red-600"
                           : "bg-dark-900 border-slate-600"
-                      }`}
+                        }`}
                     >
                       <p className="text-[10px] font-mono break-all max-w-[120px]">
                         {n.hash.slice(0, 16)}...
@@ -1533,11 +1621,10 @@ function TamperTest({
         {integrity && (
           <div className="mt-3">
             <span
-              className={`inline-block px-2 py-1 rounded text-sm ${
-                integrity.verified
+              className={`inline-block px-2 py-1 rounded text-sm ${integrity.verified
                   ? "bg-green-900 text-green-200"
                   : "bg-red-900 text-red-200"
-              }`}
+                }`}
             >
               {integrity.status}
             </span>

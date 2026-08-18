@@ -10,7 +10,15 @@
     "frontendDist": "../frontend/dist"
   },
   "app": {
-    "windows": [],
+    "windows": [
+      {
+        "label": "main",
+        "title": "VeilDB",
+        "width": 1200,
+        "height": 800,
+        "center": true
+      }
+    ],
     "security": {
       "csp": null
     }

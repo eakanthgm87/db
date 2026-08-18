@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use veildb_access::{AccessEngine, EncryptedArchive, ReEncryptedBlob, TrustEntry};
-use veildb_crypto::{SigningKeyPair, X25519KeyPair, derive_key};
+use veildb_crypto::{SigningKeyPair, X25519KeyPair, Ciphertext, derive_key, decrypt, encrypt};
 use veildb_integrity::{operation_hash, verify_operations};
 use veildb_query::{DbState, OperationSummary, QueryEngine, build_log};
 use veildb_storage::{
@@ -46,6 +46,10 @@ const META_FORMAT_VERSION: &str = "veildb.format_version";
 const META_KEY_VERSION: &str = "veildb.key_version";
 /// Metadata key for the salt.
 const META_SALT: &str = "veildb.salt";
+/// Metadata key for the encrypted signing key.
+const META_SIGNING_KEY: &str = "veildb.device.signing_key";
+/// Metadata key for the encrypted X25519 key.
+const META_X25519_KEY: &str = "veildb.device.x25519_key";
 
 /// A status report of the database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,12 +212,57 @@ impl VeilDbCore {
         let master_key = derive_key(passphrase.as_bytes(), &salt)?;
 
         // Generate or load the device keypairs.
-        // For a new database, we generate fresh keypairs. For an
-        // existing database, the keypairs would normally be stored
-        // encrypted. For simplicity, we generate new ones each time
-        // (in a real deployment, they'd be loaded from a keystore).
-        let signing = Arc::new(SigningKeyPair::generate());
-        let x25519 = Arc::new(X25519KeyPair::generate());
+        let signing: Arc<SigningKeyPair>;
+        let x25519: Arc<X25519KeyPair>;
+
+        if exists {
+            let signing_ct = storage.get_metadata(META_SIGNING_KEY)?;
+            let x25519_ct = storage.get_metadata(META_X25519_KEY)?;
+
+            if let (Some(sk_bytes), Some(xk_bytes)) = (signing_ct, x25519_ct) {
+                if !sk_bytes.is_empty() && !xk_bytes.is_empty() {
+                    let sk_ct: Ciphertext = postcard::from_bytes(&sk_bytes)
+                        .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                    let xk_ct: Ciphertext = postcard::from_bytes(&xk_bytes)
+                        .map_err(|e| CoreError::Serialization(e.to_string()))?;
+
+                    let sk_secret = decrypt(&master_key, &sk_ct)
+                        .map_err(|e| CoreError::Crypto(e))?;
+                    let xk_secret = decrypt(&master_key, &xk_ct)
+                        .map_err(|e| CoreError::Crypto(e))?;
+
+                    let mut sk_arr = [0u8; 32];
+                    sk_arr.copy_from_slice(&sk_secret);
+                    let mut xk_arr = [0u8; 32];
+                    xk_arr.copy_from_slice(&xk_secret);
+
+                    signing = Arc::new(SigningKeyPair::from_seed(sk_arr));
+                    x25519 = Arc::new(X25519KeyPair::from_seed(xk_arr));
+                } else {
+                    signing = Arc::new(SigningKeyPair::generate());
+                    x25519 = Arc::new(X25519KeyPair::generate());
+                }
+            } else {
+                signing = Arc::new(SigningKeyPair::generate());
+                x25519 = Arc::new(X25519KeyPair::generate());
+            }
+        } else {
+            signing = Arc::new(SigningKeyPair::generate());
+            x25519 = Arc::new(X25519KeyPair::generate());
+
+            let sk_ct = encrypt(&master_key, key_version, signing.secret_bytes().as_ref())
+                .map_err(|e| CoreError::Crypto(e))?;
+            let xk_ct = encrypt(&master_key, key_version, &x25519.secret_bytes())
+                .map_err(|e| CoreError::Crypto(e))?;
+
+            let sk_bytes = postcard::to_allocvec(&sk_ct)
+                .map_err(|e| CoreError::Serialization(e.to_string()))?;
+            let xk_bytes = postcard::to_allocvec(&xk_ct)
+                .map_err(|e| CoreError::Serialization(e.to_string()))?;
+
+            storage.set_metadata(META_SIGNING_KEY, &sk_bytes)?;
+            storage.set_metadata(META_X25519_KEY, &xk_bytes)?;
+        }
 
         // Create the access engine.
         let mut access = AccessEngine::new(

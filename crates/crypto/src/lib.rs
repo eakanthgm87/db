@@ -201,6 +201,18 @@ impl X25519KeyPair {
         self.public.to_bytes()
     }
 
+    /// Get the secret key bytes (for backup/export).
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+
+    /// Create a keypair from a 32-byte seed.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let secret = x25519_dalek::StaticSecret::from(seed);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        Self { secret, public }
+    }
+
     /// Perform X25519 key exchange with a peer's public key.
     pub fn exchange(&self, peer_public: &[u8; 32]) -> Result<Key, CryptoError> {
         let peer = x25519_dalek::PublicKey::from(*peer_public);

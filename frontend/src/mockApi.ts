@@ -380,9 +380,9 @@ async function call<T>(cmd: string, args: Record<string, unknown>): Promise<ApiR
       case "vdb_list_devices":
         return ok(mockListDevices() as T);
       case "vdb_trust_device":
-        return ok(mockTrustDevice(args.public_key as string) as T);
+        return ok(mockTrustDevice((args.publicKey ?? args.public_key) as string) as T);
       case "vdb_revoke_device":
-        return ok(mockRevokeDevice(args.device_id as string) as T);
+        return ok(mockRevokeDevice((args.deviceId ?? args.device_id) as string) as T);
       case "vdb_backup":
         return ok(mockBackup(args.output as string) as T);
       case "vdb_restore":
@@ -399,7 +399,7 @@ async function call<T>(cmd: string, args: Record<string, unknown>): Promise<ApiR
         return ok(mockGetMerkleTree() as T);
       case "vdb_dev_corrupt_operation":
         return ok(mockDevCorruptOperation(
-          args.device_id as string,
+          (args.deviceId ?? args.device_id) as string,
           args.sequence as number
         ) as T);
       default:
@@ -425,9 +425,9 @@ export const api = {
   log: () => call<any>("vdb_log", {}),
   listDevices: () => call<any>("vdb_list_devices", {}),
   trustDevice: (publicKey: string) =>
-    call<any>("vdb_trust_device", { public_key: publicKey }),
+    call<any>("vdb_trust_device", { publicKey }),
   revokeDevice: (deviceId: string) =>
-    call<any>("vdb_revoke_device", { device_id: deviceId }),
+    call<any>("vdb_revoke_device", { deviceId }),
   backup: (output: string) => call<any>("vdb_backup", { output }),
   restore: (archive: string) => call<any>("vdb_restore", { archive }),
   snapshot: () => call<number>("vdb_snapshot", {}),
@@ -436,5 +436,5 @@ export const api = {
   getDag: () => call<any>("vdb_get_dag", {}),
   getMerkleTree: () => call<any>("vdb_get_merkle_tree", {}),
   devCorruptOperation: (deviceId: string, sequence: number) =>
-    call<void>("vdb_dev_corrupt_operation", { device_id: deviceId, sequence }),
+    call<void>("vdb_dev_corrupt_operation", { deviceId, sequence }),
 };

@@ -654,29 +654,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     writeln!(f, "Working dir: {:?}", std::env::current_dir())?;
     writeln!(f, "Exe path: {:?}", std::env::current_exe())?;
 
+    // Window is created from tauri.conf.json — no programmatic creation needed.
+    writeln!(f, "Window configured via tauri.conf.json")?;
+
+    // Manage app state.
     app.manage(AppState::new());
-
-    // Create the window programmatically
-    writeln!(f, "Creating window programmatically...")?;
-    let url = if cfg!(dev) {
-        writeln!(f, "Mode: DEV - using devUrl")?;
-        tauri::WebviewUrl::External("http://localhost:1420".parse().unwrap())
-    } else {
-        writeln!(f, "Mode: PRODUCTION - using embedded assets")?;
-        tauri::WebviewUrl::App("index.html".into())
-    };
-
-    let window = tauri::WebviewWindowBuilder::new(app, "main", url)
-        .title("VeilDB")
-        .inner_size(1200.0, 800.0)
-        .center()
-        .visible(true)
-        .build();
-
-    match &window {
-        Ok(_) => writeln!(f, "Window created successfully!")?,
-        Err(e) => writeln!(f, "Window creation error: {e}")?,
-    }
 
     writeln!(f, "Setup complete.")?;
 
@@ -687,6 +669,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 pub fn run() {
     let result = tauri::Builder::default()
         .setup(setup)
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             vdb_init,
             vdb_open,

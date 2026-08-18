@@ -121,17 +121,13 @@ impl<S: StorageEngine> AccessEngine<S> {
         key_version: u32,
         db_id: [u8; 32],
     ) -> Self {
-        // We need the actual key data. Since SigningKeyPair doesn't impl Clone,
-        // we'll generate fresh ones for internal use. The Arc references in core
-        // handle the real lifecycle.
         let sk = signing_key.borrow();
-        let _xk = x25519_key.borrow();
+        let xk = x25519_key.borrow();
         let device_id: [u8; 32] = blake3::hash(sk.public_key().as_ref()).into();
         Self {
             storage,
-            // Re-generate for ownership. The core holds Arc references to the originals.
-            signing_key: SigningKeyPair::generate(),
-            x25519_key: X25519KeyPair::generate(),
+            signing_key: SigningKeyPair::from_seed(*sk.secret_bytes()),
+            x25519_key: X25519KeyPair::from_seed(xk.secret_bytes()),
             device_id,
             key_ring: KeyRing::new(master_key, key_version),
             db_id,
