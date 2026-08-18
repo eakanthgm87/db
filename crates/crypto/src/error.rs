@@ -48,6 +48,10 @@ pub enum CryptoError {
     /// Unsupported key version.
     #[error("Unsupported key version: {0}")]
     UnsupportedKeyVersion(u32),
+
+    /// Unknown key version (not found in the key ring).
+    #[error("Unknown key version: {0}")]
+    UnknownKeyVersion(u32),
 }
 
 impl From<postcard::Error> for CryptoError {

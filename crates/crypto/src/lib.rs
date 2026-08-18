@@ -64,6 +64,77 @@ pub struct Ciphertext {
     pub data: Vec<u8>,
 }
 
+/// A key ring that manages multiple key versions.
+///
+/// Historical ciphertexts stay decryptable under their original
+/// `key_version`. Rotation adds a new key version without invalidating
+/// older ones.
+#[derive(Clone)]
+pub struct KeyRing {
+    /// Map of key version → key.
+    keys: std::collections::BTreeMap<u32, Key>,
+    /// The active (latest) key version.
+    active_version: u32,
+}
+
+impl KeyRing {
+    /// Create a new key ring with a single initial key.
+    pub fn new(initial_key: Key, initial_version: u32) -> Self {
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert(initial_version, initial_key);
+        Self {
+            keys,
+            active_version: initial_version,
+        }
+    }
+
+    /// Get the active key version.
+    pub fn active_version(&self) -> u32 {
+        self.active_version
+    }
+
+    /// Get the key for a specific version.
+    ///
+    /// Returns `CryptoError::UnknownKeyVersion` if the version is not
+    /// present in the ring.
+    pub fn key_for_version(&self, version: u32) -> Result<&Key, CryptoError> {
+        self.keys
+            .get(&version)
+            .ok_or(CryptoError::UnknownKeyVersion(version))
+    }
+
+    /// Get the active key.
+    pub fn active_key(&self) -> &Key {
+        // The active version is always present in the ring.
+        &self.keys[&self.active_version]
+    }
+
+    /// Rotate the key: derive a new key from the existing master secret
+    /// and make it the active version.
+    ///
+    /// The new key is derived deterministically from the current active
+    /// key via BLAKE3 (a KDF-style derivation). Historical keys remain
+    /// in the ring for decrypting old ciphertexts.
+    pub fn rotate_key(&mut self) -> Result<u32, CryptoError> {
+        let new_version = self.active_version + 1;
+        let current = self.active_key().as_bytes();
+        // Derive a new key from the current one via BLAKE3.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(current);
+        hasher.update(&new_version.to_le_bytes());
+        let derived = *hasher.finalize().as_bytes();
+        let new_key = Key::from_bytes(derived);
+        self.keys.insert(new_version, new_key);
+        self.active_version = new_version;
+        Ok(new_version)
+    }
+
+    /// Get all key versions present in the ring.
+    pub fn versions(&self) -> Vec<u32> {
+        self.keys.keys().copied().collect()
+    }
+}
+
 /// An Ed25519 signing keypair.
 ///
 /// The secret key is zeroized on drop.
@@ -363,5 +434,52 @@ mod tests {
         drop(key);
         // Can't easily verify zeroization after drop, but the type
         // implements ZeroizeOnDrop which is the guarantee.
+    }
+
+    #[test]
+    fn key_ring_rotation_multiversion() {
+        let key = Key::generate();
+        let mut ring = KeyRing::new(key, 1);
+        assert_eq!(ring.active_version(), 1);
+
+        // Encrypt under v1.
+        let ct1 = encrypt(ring.active_key(), 1, b"data-v1").unwrap();
+        assert_eq!(ct1.key_version, 1);
+
+        // Rotate to v2.
+        let v2 = ring.rotate_key().unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(ring.active_version(), 2);
+
+        // Encrypt under v2.
+        let ct2 = encrypt(ring.active_key(), 2, b"data-v2").unwrap();
+        assert_eq!(ct2.key_version, 2);
+
+        // Both v1 and v2 ciphertexts decrypt correctly.
+        let pt1 = decrypt(ring.key_for_version(1).unwrap(), &ct1).unwrap();
+        assert_eq!(pt1, b"data-v1");
+        let pt2 = decrypt(ring.key_for_version(2).unwrap(), &ct2).unwrap();
+        assert_eq!(pt2, b"data-v2");
+
+        // Versions list contains both.
+        assert_eq!(ring.versions(), vec![1, 2]);
+    }
+
+    #[test]
+    fn key_ring_unknown_version() {
+        let key = Key::generate();
+        let ring = KeyRing::new(key, 1);
+        let err = ring.key_for_version(99).unwrap_err();
+        assert!(matches!(err, CryptoError::UnknownKeyVersion(99)));
+    }
+
+    #[test]
+    fn key_ring_rotation_derives_distinct_keys() {
+        let key = Key::generate();
+        let mut ring = KeyRing::new(key, 1);
+        let v1_key = ring.active_key().as_bytes().clone();
+        ring.rotate_key().unwrap();
+        let v2_key = ring.active_key().as_bytes().clone();
+        assert_ne!(v1_key, v2_key);
     }
 }

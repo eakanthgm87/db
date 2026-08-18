@@ -468,6 +468,14 @@ impl<S: StorageEngine> SyncEngine<S> {
     /// Returns a report of the sync operation.
     pub async fn sync(&mut self, backend: &mut dyn SyncBackend) -> Result<SyncReport, SyncError> {
         // Step 1: Authenticate peer.
+        //
+        // Both peers may initiate concurrently (each sends `Hello`). To
+        // handle this, after sending our `Hello` we peek at what we
+        // receive:
+        // - If we receive the peer's `Hello` (concurrent initiation),
+        //   we respond with `HelloAck` for the peer, then receive our
+        //   own `HelloAck`.
+        // - If we receive `HelloAck` directly, we validate it.
         let hello = SyncMessage::Hello {
             protocol_version: SYNC_PROTOCOL_VERSION,
             device_id: self.device_id(),
@@ -476,7 +484,42 @@ impl<S: StorageEngine> SyncEngine<S> {
         };
         backend.send(hello).await?;
 
-        let hello_ack = backend.receive().await?;
+        let first_message = backend.receive().await?;
+
+        // If the peer also initiated, respond with HelloAck.
+        let hello_ack = match &first_message {
+            SyncMessage::Hello {
+                protocol_version,
+                device_id: _,
+                public_key,
+                nonce,
+            } => {
+                if *protocol_version != SYNC_PROTOCOL_VERSION {
+                    return Err(SyncError::InvalidPeerMessage(
+                        "protocol version mismatch".to_string(),
+                    ));
+                }
+                // Sign our own HelloAck for the peer.
+                let mut msg = Vec::with_capacity(32 + 32 + 32);
+                msg.extend_from_slice(&self.signing.public_key());
+                msg.extend_from_slice(nonce);
+                msg.extend_from_slice(&self.db_id);
+                let signature = self.signing.sign(&msg);
+                backend
+                    .send(SyncMessage::HelloAck {
+                        protocol_version: SYNC_PROTOCOL_VERSION,
+                        device_id: self.device_id(),
+                        public_key: self.signing.public_key(),
+                        nonce: *nonce,
+                        signature,
+                    })
+                    .await?;
+                // Now receive our own HelloAck.
+                backend.receive().await?
+            }
+            _ => first_message,
+        };
+
         let peer_device_id = match &hello_ack {
             SyncMessage::HelloAck {
                 protocol_version,
@@ -570,12 +613,12 @@ impl<S: StorageEngine> SyncEngine<S> {
         };
 
         // Step 5-6: Diff subtrees and identify missing ops.
-        // We compute the set of operation hashes we have and the set
-        // the peer has (from the Merkle root exchange). Since we can't
-        // reconstruct the peer's full set from just the root, we
-        // request the peer's operation hashes.
+        //
+        // Both peers send their full set of operation hashes
+        // concurrently. Each side then computes which of its own ops
+        // the peer is missing and sends those in step 7.
         let local_hashes: Vec<[u8; 32]> = local_ops.iter().map(operation_hash).collect();
-        let local_tree = MerkleTree::build(&local_hashes);
+        let local_hash_set: HashSet<[u8; 32]> = local_hashes.iter().copied().collect();
 
         // Send our hashes so the peer can compute the diff.
         backend
@@ -584,9 +627,8 @@ impl<S: StorageEngine> SyncEngine<S> {
             })
             .await?;
 
-        // Receive the peer's missing operation hashes (what they need
-        // from us).
-        let peer_missing = match backend.receive().await? {
+        // Receive the peer's hashes.
+        let peer_hashes = match backend.receive().await? {
             SyncMessage::MissingOperations { hashes } => hashes,
             SyncMessage::Error { message } => {
                 return Err(SyncError::InvalidPeerMessage(message.clone()));
@@ -599,15 +641,14 @@ impl<S: StorageEngine> SyncEngine<S> {
         };
 
         // Step 7: Transfer ciphertext+meta.
-        // Send the operations the peer needs.
-        let local_by_hash: HashMap<[u8; 32], Operation> = local_ops
-            .iter()
-            .map(|op| (operation_hash(op), op.clone()))
-            .collect();
+        // Compute which of our ops the peer is missing: ops whose
+        // hash is not in the peer's set.
+        let peer_hash_set: HashSet<[u8; 32]> = peer_hashes.iter().copied().collect();
 
-        let ops_to_send: Vec<Operation> = peer_missing
+        let ops_to_send: Vec<Operation> = local_ops
             .iter()
-            .filter_map(|h| local_by_hash.get(h).cloned())
+            .filter(|op| !peer_hash_set.contains(&operation_hash(op)))
+            .cloned()
             .collect();
 
         backend
@@ -806,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_backend_roundtrip() {
-        let (backend_a, backend_b) = MockBackend::pair();
+        let (mut backend_a, mut backend_b) = MockBackend::pair();
 
         backend_a
             .send(SyncMessage::Hello {

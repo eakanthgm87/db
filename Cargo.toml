@@ -57,7 +57,7 @@ proptest = "1"
 criterion = "0.5"
 
 # Tauri
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["wry"] }
 tauri-build = "2"
 
 [profile.release]

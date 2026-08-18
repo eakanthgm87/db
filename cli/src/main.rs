@@ -101,6 +101,8 @@ enum DeviceAction {
         /// The device ID (hex, 64 chars).
         device_id: String,
     },
+    /// Rotate the master key.
+    RotateKey,
 }
 
 fn main() {
@@ -282,6 +284,11 @@ fn cmd_device(db: &PathBuf, action: DeviceAction) -> Result<()> {
             let id = parse_hex(&device_id)?;
             core.revoke_device(&id)?;
             println!("Device revoked: {}", hex(&id));
+            Ok(())
+        }
+        DeviceAction::RotateKey => {
+            let new_version = core.rotate_key()?;
+            println!("Key rotated to version {}", new_version);
             Ok(())
         }
     }

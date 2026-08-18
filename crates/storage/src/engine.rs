@@ -81,6 +81,17 @@ pub trait StorageEngine {
 
     /// Check if the database is empty (no operations).
     fn is_empty(&self) -> Result<bool, StorageError>;
+
+    /// Dev-only: corrupt an operation's ciphertext in the local store.
+    ///
+    /// This is ONLY available in debug builds. It flips bytes in the
+    /// operation's ciphertext to simulate tampering.
+    #[cfg(debug_assertions)]
+    fn corrupt_operation(
+        &mut self,
+        device_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<(), StorageError>;
 }
 
 /// SQLite-backed implementation of [`StorageEngine`].
@@ -621,6 +632,44 @@ impl StorageEngine for SqliteStorage {
             .conn
             .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))?;
         Ok(count == 0)
+    }
+
+    #[cfg(debug_assertions)]
+    fn corrupt_operation(
+        &mut self,
+        device_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<(), StorageError> {
+        // Read the current ciphertext.
+        let id = OperationId::new(*device_id, sequence);
+        let id_bytes = postcard::to_allocvec(&id)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM operations WHERE operation_id = ?1",
+                params![id_bytes],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+
+        let ciphertext = row.ok_or(StorageError::OperationNotFound(id))?;
+
+        // Flip a byte in the ciphertext.
+        let mut corrupted = ciphertext;
+        if !corrupted.is_empty() {
+            let idx = corrupted.len() / 2;
+            corrupted[idx] ^= 0xFF;
+        }
+
+        // Update the ciphertext and recompute the operation hash.
+        let affected = self.conn.execute(
+            "UPDATE operations SET ciphertext = ?1 WHERE operation_id = ?2",
+            params![corrupted, id_bytes],
+        )?;
+        if affected == 0 {
+            return Err(StorageError::OperationNotFound(id));
+        }
+        Ok(())
     }
 }
 

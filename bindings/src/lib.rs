@@ -477,6 +477,125 @@ mod commands {
             Err(e) => ApiResponse::err(ApiError::from(e)),
         }
     }
+
+    #[tauri::command]
+    pub fn vdb_rotate_key(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core_ref.rotate_key() {
+            Ok(new_version) => ApiResponse::ok(serde_json::json!({
+                "key_version": new_version,
+            })),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_get_dag(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.get_dag() {
+            Ok(dag) => {
+                let nodes: Vec<serde_json::Value> = dag.nodes.iter().map(|n| {
+                    serde_json::json!({
+                        "id": n.id,
+                        "device_id": hex(&n.device_id),
+                        "sequence": n.sequence,
+                        "hash": hex(&n.hash),
+                        "parents": n.parents.iter().map(|p| hex(p)).collect::<Vec<_>>(),
+                        "signature_status": n.signature_status,
+                        "clock": n.clock,
+                    })
+                }).collect();
+                let edges: Vec<serde_json::Value> = dag.edges.iter().map(|e| {
+                    serde_json::json!({
+                        "from": hex(&e.from),
+                        "to": hex(&e.to),
+                    })
+                }).collect();
+                ApiResponse::ok(serde_json::json!({
+                    "nodes": nodes,
+                    "edges": edges,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    #[tauri::command]
+    pub fn vdb_get_merkle_tree(state: State<'_, AppState>) -> ApiResponse<serde_json::Value> {
+        let guard = state.core.lock().unwrap();
+        let core = match guard.as_ref() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        match core.get_merkle_tree() {
+            Ok(tree) => {
+                let leaves: Vec<serde_json::Value> = tree.leaves.iter().map(|l| {
+                    serde_json::json!({
+                        "id": l.id,
+                        "hash": hex(&l.hash),
+                        "level": l.level,
+                        "index": l.index,
+                        "is_leaf": l.is_leaf,
+                    })
+                }).collect();
+                let internal: Vec<serde_json::Value> = tree.internal_nodes.iter().map(|n| {
+                    serde_json::json!({
+                        "id": n.id,
+                        "hash": hex(&n.hash),
+                        "level": n.level,
+                        "index": n.index,
+                        "is_leaf": n.is_leaf,
+                    })
+                }).collect();
+                ApiResponse::ok(serde_json::json!({
+                    "root": hex(&tree.root),
+                    "leaves": leaves,
+                    "internal_nodes": internal,
+                }))
+            }
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
+
+    /// Dev-only: corrupt an operation's ciphertext.
+    ///
+    /// This is ONLY available in debug builds. It flips bytes in the
+    /// operation's ciphertext to simulate tampering. Never callable
+    /// from the CLI's normal command set and not a `core` method usable
+    /// outside dev builds.
+    #[cfg(debug_assertions)]
+    #[tauri::command]
+    pub fn vdb_dev_corrupt_operation(
+        state: State<'_, AppState>,
+        device_id: String,
+        sequence: u64,
+    ) -> ApiResponse<()> {
+        let mut guard = state.core.lock().unwrap();
+        let core_ref = match guard.as_mut() {
+            Some(c) => c,
+            None => return ApiResponse::err(not_initialized()),
+        };
+        let id = match parse_hex(&device_id) {
+            Ok(p) => p,
+            Err(e) => return ApiResponse::err(ApiError {
+                message: e,
+                code: None,
+                is_integrity: false,
+            }),
+        };
+        match core_ref.dev_corrupt_operation(&id, sequence) {
+            Ok(()) => ApiResponse::ok(()),
+            Err(e) => ApiResponse::err(ApiError::from(e)),
+        }
+    }
 }
 
 use commands::*;
@@ -522,13 +641,51 @@ fn parse_clock(s: &str) -> Result<LogicalClock, String> {
 
 /// Setup the Tauri plugin.
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let log_file = std::env::current_exe()
+        .unwrap_or_default()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("veildb-debug.log");
+
+    let mut f = std::fs::File::create(&log_file)?;
+    writeln!(f, "=== VeilDB Setup ===")?;
+    writeln!(f, "Working dir: {:?}", std::env::current_dir())?;
+    writeln!(f, "Exe path: {:?}", std::env::current_exe())?;
+
     app.manage(AppState::new());
+
+    // Create the window programmatically
+    writeln!(f, "Creating window programmatically...")?;
+    let url = if cfg!(dev) {
+        writeln!(f, "Mode: DEV - using devUrl")?;
+        tauri::WebviewUrl::External("http://localhost:1420".parse().unwrap())
+    } else {
+        writeln!(f, "Mode: PRODUCTION - using embedded assets")?;
+        tauri::WebviewUrl::App("index.html".into())
+    };
+
+    let window = tauri::WebviewWindowBuilder::new(app, "main", url)
+        .title("VeilDB")
+        .inner_size(1200.0, 800.0)
+        .center()
+        .visible(true)
+        .build();
+
+    match &window {
+        Ok(_) => writeln!(f, "Window created successfully!")?,
+        Err(e) => writeln!(f, "Window creation error: {e}")?,
+    }
+
+    writeln!(f, "Setup complete.")?;
+
     Ok(())
 }
 
 /// Register all Tauri commands.
 pub fn run() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .setup(setup)
         .invoke_handler(tauri::generate_handler![
             vdb_init,
@@ -547,7 +704,21 @@ pub fn run() {
             vdb_restore,
             vdb_snapshot,
             vdb_sync_lan,
+            vdb_rotate_key,
+            vdb_get_dag,
+            vdb_get_merkle_tree,
+            #[cfg(debug_assertions)]
+            vdb_dev_corrupt_operation,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
+        .run(tauri::generate_context!());
+
+    if let Err(e) = result {
+        let log_file = std::env::current_exe()
+            .unwrap_or_default()
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("veildb-error.log");
+        let _ = std::fs::write(&log_file, format!("Tauri run error: {e}\n"));
+        eprintln!("error while running tauri application: {e}");
+    }
+}

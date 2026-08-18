@@ -2,11 +2,49 @@ import { useState, useEffect } from "react";
 import { api } from "./mockApi";
 import type { DbStatus, DeviceInfo, OperationSummary } from "./types";
 
-type Tab = "dashboard" | "devices" | "sync" | "time-travel" | "backup" | "keys";
+type Tab =
+  | "dashboard"
+  | "devices"
+  | "sync"
+  | "time-travel"
+  | "backup"
+  | "keys"
+  | "graph"
+  | "merkle"
+  | "tamper";
 
 interface IntegrityResult {
   status: string;
   verified: boolean;
+}
+
+interface DagNode {
+  id: string;
+  device_id: string;
+  sequence: number;
+  hash: string;
+  parents: string[];
+  signature_status: string;
+  clock: string[];
+}
+
+interface DagEdge {
+  from: string;
+  to: string;
+}
+
+interface MerkleNode {
+  id: string;
+  hash: string;
+  level: number;
+  index: number;
+  is_leaf: boolean;
+}
+
+interface MerkleTreeData {
+  root: string;
+  leaves: MerkleNode[];
+  internal_nodes: MerkleNode[];
 }
 
 function hex(bytes: Uint8Array | string): string {
@@ -16,6 +54,16 @@ function hex(bytes: Uint8Array | string): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+// Deterministic color per device_id.
+function deviceColor(deviceId: string): string {
+  let hash = 0;
+  for (let i = 0; i < deviceId.length; i++) {
+    hash = (hash * 31 + deviceId.charCodeAt(i)) >>> 0;
+  }
+  const hue = hash % 360;
+  return `hsl(${hue}, 70%, 50%)`;
 }
 
 function App() {
@@ -29,6 +77,9 @@ function App() {
   const [integrity, setIntegrity] = useState<IntegrityResult | null>(null);
   const [syncLog, setSyncLog] = useState<string[]>([]);
   const [syncing, setSyncing] = useState(false);
+
+  // Developer mode toggle (React state only, not persisted).
+  const [devMode, setDevMode] = useState(false);
 
   // Key/value form state.
   const [keyInput, setKeyInput] = useState("");
@@ -49,6 +100,18 @@ function App() {
   const [backupPath, setBackupPath] = useState("");
   const [restorePath, setRestorePath] = useState("");
 
+  // DAG / Merkle state.
+  const [dagNodes, setDagNodes] = useState<DagNode[]>([]);
+  const [dagEdges, setDagEdges] = useState<DagEdge[]>([]);
+  const [merkleTree, setMerkleTree] = useState<MerkleTreeData | null>(null);
+  const [selectedNode, setSelectedNode] = useState<DagNode | null>(null);
+  const [tamperedHashes, setTamperedHashes] = useState<Set<string>>(new Set());
+
+  // Tamper test state.
+  const [tamperDeviceId, setTamperDeviceId] = useState("");
+  const [tamperSequence, setTamperSequence] = useState("");
+  const [tamperResult, setTamperResult] = useState<string | null>(null);
+
   async function initDb() {
     setError(null);
     if (!dbPath) {
@@ -58,8 +121,6 @@ function App() {
     try {
       const result = await api.init(dbPath, passphrase);
       if (result.success) {
-        // Only load the full status here; do not set status from the
-        // partial init response.
         await refreshStatus();
       } else {
         setError(result.error?.message || "Init failed");
@@ -78,8 +139,6 @@ function App() {
     try {
       const result = await api.open(dbPath, passphrase);
       if (result.success) {
-        // Only load the full status here; do not set status from the
-        // partial open response.
         await refreshStatus();
       } else {
         setError(result.error?.message || "Open failed");
@@ -97,6 +156,11 @@ function App() {
       setOperations([]);
       setIntegrity(null);
       setDbPath(null);
+      setDagNodes([]);
+      setDagEdges([]);
+      setMerkleTree(null);
+      setSelectedNode(null);
+      setTamperedHashes(new Set());
     } catch (e: any) {
       setError(e.message || String(e));
     }
@@ -135,6 +199,29 @@ function App() {
     }
   }
 
+  async function refreshDag() {
+    try {
+      const result = await api.getDag();
+      if (result.success && result.data) {
+        setDagNodes(result.data.nodes || []);
+        setDagEdges(result.data.edges || []);
+      }
+    } catch (e: any) {
+      // ignore
+    }
+  }
+
+  async function refreshMerkle() {
+    try {
+      const result = await api.getMerkleTree();
+      if (result.success && result.data) {
+        setMerkleTree(result.data);
+      }
+    } catch (e: any) {
+      // ignore
+    }
+  }
+
   async function handlePut() {
     setError(null);
     try {
@@ -144,6 +231,8 @@ function App() {
         setValueInput("");
         refreshOperations();
         refreshStatus();
+        refreshDag();
+        refreshMerkle();
       } else {
         setError(result.error?.message || "Put failed");
       }
@@ -173,6 +262,22 @@ function App() {
       const result = await api.verify();
       if (result.success && result.data) {
         setIntegrity(result.data);
+        // If tampered, highlight the failed hashes in the Merkle view.
+        if (!result.data.verified) {
+          const dag = await api.getDag();
+          if (dag.success && dag.data) {
+            const hashes = new Set<string>();
+            (dag.data.nodes || []).forEach((n: DagNode) => {
+              // In a real implementation, the verify response would
+              // include failed hashes. For now, we highlight all nodes
+              // when tampered.
+              hashes.add(n.hash);
+            });
+            setTamperedHashes(hashes);
+          }
+        } else {
+          setTamperedHashes(new Set());
+        }
       } else {
         setError(result.error?.message || "Verify failed");
       }
@@ -244,6 +349,8 @@ function App() {
         refreshStatus();
         refreshDevices();
         refreshOperations();
+        refreshDag();
+        refreshMerkle();
         alert("Restore completed");
       } else {
         setError(result.error?.message || "Restore failed");
@@ -283,6 +390,8 @@ function App() {
           `Merkle root: ${result.data.merkle_root}`,
         ]);
         refreshStatus();
+        refreshDag();
+        refreshMerkle();
       } else {
         setError(result.error?.message || "Sync failed");
       }
@@ -311,11 +420,52 @@ function App() {
     }
   }
 
+  async function handleRotateKey() {
+    setError(null);
+    try {
+      const result = await api.rotateKey();
+      if (result.success && result.data) {
+        alert(`Key rotated to version ${result.data.key_version}`);
+        refreshStatus();
+      } else {
+        setError(result.error?.message || "Rotate key failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
+    }
+  }
+
+  async function handleCorrupt() {
+    setError(null);
+    setTamperResult(null);
+    if (!tamperDeviceId || !tamperSequence) {
+      setError("Enter device ID and sequence");
+      return;
+    }
+    try {
+      const result = await api.devCorruptOperation(
+        tamperDeviceId,
+        parseInt(tamperSequence)
+      );
+      if (result.success) {
+        setTamperResult("Operation corrupted. Run Verify to check integrity.");
+        refreshDag();
+        refreshMerkle();
+      } else {
+        setError(result.error?.message || "Corrupt failed");
+      }
+    } catch (e: any) {
+      setError(e.message || String(e));
+    }
+  }
+
   // When DB opens or tab changes, refresh data.
   useEffect(() => {
     if (status) {
       refreshDevices();
       refreshOperations();
+      refreshDag();
+      refreshMerkle();
     }
   }, [status]);
 
@@ -343,11 +493,28 @@ function App() {
 
   return (
     <div className="min-h-screen bg-dark-900 text-slate-200">
-      <header className="bg-dark-800 border-b border-slate-700 px-6 py-4">
-        <h1 className="text-2xl font-bold text-primary-400">VeilDB</h1>
-        <p className="text-sm text-slate-400">
-          Privacy-first, local-first, zero-trust database
-        </p>
+      <header className="bg-dark-800 border-b border-slate-700 px-6 py-4 flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-primary-400">VeilDB</h1>
+          <p className="text-sm text-slate-400">
+            Privacy-first, local-first, zero-trust database
+          </p>
+        </div>
+        {status && (
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={devMode}
+                onChange={(e) => setDevMode(e.target.checked)}
+                className="accent-red-500"
+              />
+              <span className={devMode ? "text-red-400 font-bold" : "text-slate-400"}>
+                Developer Mode
+              </span>
+            </label>
+          </div>
+        )}
       </header>
 
       <div className="flex">
@@ -455,6 +622,26 @@ function App() {
                 >
                   Backup / Restore
                 </TabButton>
+                <TabButton
+                  active={activeTab === "graph"}
+                  onClick={() => setActiveTab("graph")}
+                >
+                  Operation Graph
+                </TabButton>
+                <TabButton
+                  active={activeTab === "merkle"}
+                  onClick={() => setActiveTab("merkle")}
+                >
+                  Merkle Tree
+                </TabButton>
+                {devMode && (
+                  <TabButton
+                    active={activeTab === "tamper"}
+                    onClick={() => setActiveTab("tamper")}
+                  >
+                    <span className="text-red-400">Tamper Test</span>
+                  </TabButton>
+                )}
               </div>
             </>
           )}
@@ -483,7 +670,9 @@ function App() {
                   integrity={integrity}
                   onVerify={handleVerify}
                   onSnapshot={handleSnapshot}
+                  onRotateKey={handleRotateKey}
                   operations={operations}
+                  onViewMerkle={() => setActiveTab("merkle")}
                 />
               )}
               {activeTab === "keys" && (
@@ -513,6 +702,7 @@ function App() {
                   syncing={syncing}
                   syncLog={syncLog}
                   onSync={handleSync}
+                  onViewGraph={() => setActiveTab("graph")}
                 />
               )}
               {activeTab === "time-travel" && (
@@ -533,6 +723,34 @@ function App() {
                   onRestore={handleRestore}
                   onPickBackup={pickBackupPath}
                   onPickRestore={pickRestorePath}
+                />
+              )}
+              {activeTab === "graph" && (
+                <OperationGraph
+                  nodes={dagNodes}
+                  edges={dagEdges}
+                  selectedNode={selectedNode}
+                  onSelectNode={setSelectedNode}
+                  tamperedHashes={tamperedHashes}
+                />
+              )}
+              {activeTab === "merkle" && (
+                <MerkleView
+                  tree={merkleTree}
+                  tamperedHashes={tamperedHashes}
+                />
+              )}
+              {activeTab === "tamper" && devMode && (
+                <TamperTest
+                  operations={operations}
+                  tamperDeviceId={tamperDeviceId}
+                  tamperSequence={tamperSequence}
+                  tamperResult={tamperResult}
+                  onDeviceIdChange={setTamperDeviceId}
+                  onSequenceChange={setTamperSequence}
+                  onCorrupt={handleCorrupt}
+                  onVerify={handleVerify}
+                  integrity={integrity}
                 />
               )}
             </>
@@ -571,13 +789,17 @@ function Dashboard({
   integrity,
   onVerify,
   onSnapshot,
+  onRotateKey,
   operations,
+  onViewMerkle,
 }: {
   status: DbStatus;
   integrity: IntegrityResult | null;
   onVerify: () => void;
   onSnapshot: () => void;
+  onRotateKey: () => void;
   operations: OperationSummary[];
+  onViewMerkle: () => void;
 }) {
   return (
     <div className="space-y-6">
@@ -605,16 +827,24 @@ function Dashboard({
       <div className="bg-dark-800 border border-slate-700 rounded p-4">
         <p className="text-sm text-slate-400 mb-2">Integrity</p>
         {integrity ? (
-          <div>
+          <div className="flex items-center gap-3">
             <span
-              className={`inline-block px-2 py-1 rounded text-sm ${
+              className={`inline-block px-2 py-1 rounded text-sm cursor-pointer ${
                 integrity.verified
                   ? "bg-green-900 text-green-200"
                   : "bg-red-900 text-red-200"
               }`}
+              onClick={onViewMerkle}
+              title="Click to view Merkle tree"
             >
               {integrity.status}
             </span>
+            <button
+              onClick={onVerify}
+              className="bg-dark-700 hover:bg-dark-600 px-3 py-1 rounded text-sm"
+            >
+              Re-verify
+            </button>
           </div>
         ) : (
           <button
@@ -624,6 +854,19 @@ function Dashboard({
             Verify Integrity
           </button>
         )}
+      </div>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <p className="text-sm text-slate-400 mb-2">Key Management</p>
+        <button
+          onClick={onRotateKey}
+          className="bg-dark-700 hover:bg-dark-600 px-3 py-1 rounded text-sm"
+        >
+          Rotate Key
+        </button>
+        <p className="text-xs text-slate-400 mt-2">
+          Current version: {status.key_version}
+        </p>
       </div>
 
       <div className="bg-dark-800 border border-slate-700 rounded p-4">
@@ -817,10 +1060,12 @@ function Sync({
   syncing,
   syncLog,
   onSync,
+  onViewGraph,
 }: {
   syncing: boolean;
   syncLog: string[];
   onSync: () => void;
+  onViewGraph: () => void;
 }) {
   return (
     <div className="space-y-6">
@@ -834,6 +1079,12 @@ function Sync({
           className="w-full bg-primary-600 hover:bg-primary-700 disabled:bg-slate-600 text-white rounded px-3 py-2 text-sm"
         >
           {syncing ? "Syncing..." : "Sync with LAN peer"}
+        </button>
+        <button
+          onClick={onViewGraph}
+          className="mt-2 w-full bg-dark-700 hover:bg-dark-600 rounded px-3 py-2 text-sm"
+        >
+          View Operation Graph
         </button>
       </div>
 
@@ -983,6 +1234,338 @@ function Backup({
           >
             Restore (overwrites current DB)
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OperationGraph({
+  nodes,
+  edges,
+  selectedNode,
+  onSelectNode,
+  tamperedHashes,
+}: {
+  nodes: DagNode[];
+  edges: DagEdge[];
+  selectedNode: DagNode | null;
+  onSelectNode: (n: DagNode | null) => void;
+  tamperedHashes: Set<string>;
+}) {
+  // Simple layered layout: group nodes by device, then by sequence.
+  const devices = Array.from(new Set(nodes.map((n) => n.device_id)));
+  const deviceIndex = new Map<string, number>();
+  devices.forEach((d, i) => deviceIndex.set(d, i));
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-semibold">Operation Graph</h2>
+      <p className="text-sm text-slate-400">
+        Multi-parent operation DAG. Color-coded by device. Click a node for details.
+      </p>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4 overflow-x-auto">
+        <div className="min-w-[600px]">
+          {/* Legend */}
+          <div className="flex gap-4 mb-4 flex-wrap">
+            {devices.map((d) => (
+              <div key={d} className="flex items-center gap-2">
+                <span
+                  className="w-3 h-3 rounded-full"
+                  style={{ backgroundColor: deviceColor(d) }}
+                />
+                <span className="text-xs font-mono">
+                  {d.slice(0, 8)}...
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Nodes */}
+          <div className="space-y-4">
+            {devices.map((device) => (
+              <div key={device}>
+                <p className="text-xs text-slate-500 mb-2 font-mono">
+                  Device {device.slice(0, 8)}...
+                </p>
+                <div className="flex gap-3 flex-wrap">
+                  {nodes
+                    .filter((n) => n.device_id === device)
+                    .map((n) => {
+                      const isTampered = tamperedHashes.has(n.hash);
+                      return (
+                        <div
+                          key={n.hash}
+                          onClick={() => onSelectNode(n)}
+                          className={`cursor-pointer rounded border p-2 min-w-[100px] text-center ${
+                            isTampered
+                              ? "bg-red-900 border-red-600 text-red-200"
+                              : "bg-dark-900 border-slate-600"
+                          }`}
+                          style={{
+                            borderLeft: `4px solid ${deviceColor(device)}`,
+                          }}
+                        >
+                          <p className="text-xs font-mono">
+                            {n.id}
+                          </p>
+                          <p className="text-[10px] text-slate-400">
+                            {n.signature_status}
+                          </p>
+                          {isTampered && (
+                            <p className="text-[10px] text-red-300 font-bold">
+                              TAMPERED
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Edges */}
+          <div className="mt-4">
+            <p className="text-xs text-slate-500 mb-2">Parent Links</p>
+            <div className="space-y-1 max-h-40 overflow-y-auto">
+              {edges.map((e, i) => (
+                <p key={i} className="text-[10px] font-mono text-slate-500">
+                  {e.from.slice(0, 12)}... → {e.to.slice(0, 12)}...
+                </p>
+              ))}
+              {edges.length === 0 && (
+                <p className="text-xs text-slate-600">No edges yet</p>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Side panel */}
+      {selectedNode && (
+        <div className="bg-dark-800 border border-slate-700 rounded p-4">
+          <h3 className="text-lg font-medium mb-3">Operation Details</h3>
+          <div className="space-y-2 text-sm">
+            <p><span className="text-slate-400">ID:</span> <span className="font-mono">{selectedNode.id}</span></p>
+            <p><span className="text-slate-400">Device:</span> <span className="font-mono">{selectedNode.device_id}</span></p>
+            <p><span className="text-slate-400">Sequence:</span> {selectedNode.sequence}</p>
+            <p><span className="text-slate-400">Hash:</span> <span className="font-mono break-all">{selectedNode.hash}</span></p>
+            <p><span className="text-slate-400">Parents:</span> <span className="font-mono">{selectedNode.parents.length}</span></p>
+            <p><span className="text-slate-400">Signature:</span> {selectedNode.signature_status}</p>
+            <p><span className="text-slate-400">Clock:</span> <span className="font-mono">{selectedNode.clock.join(", ")}</span></p>
+            <button
+              onClick={() => onSelectNode(null)}
+              className="mt-2 bg-dark-700 hover:bg-dark-600 px-3 py-1 rounded text-sm"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MerkleView({
+  tree,
+  tamperedHashes,
+}: {
+  tree: MerkleTreeData | null;
+  tamperedHashes: Set<string>;
+}) {
+  if (!tree) {
+    return (
+      <div className="space-y-6">
+        <h2 className="text-xl font-semibold">Merkle Tree</h2>
+        <p className="text-sm text-slate-400">No tree data available.</p>
+      </div>
+    );
+  }
+
+  // Group nodes by level.
+  const maxLevel = Math.max(
+    ...tree.leaves.map((l) => l.level),
+    ...tree.internal_nodes.map((n) => n.level),
+    0
+  );
+
+  const levels: MerkleNode[][] = [];
+  for (let l = 0; l <= maxLevel; l++) {
+    const levelNodes = [
+      ...tree.leaves.filter((n) => n.level === l),
+      ...tree.internal_nodes.filter((n) => n.level === l),
+    ];
+    levels.push(levelNodes);
+  }
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-semibold">Merkle Tree</h2>
+      <p className="text-sm text-slate-400">
+        Root at top, branching down to operation-hash leaves.
+      </p>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4 overflow-x-auto">
+        <div className="min-w-[600px]">
+          {/* Root */}
+          <div className="text-center mb-4">
+            <div className="inline-block bg-primary-900 border border-primary-600 rounded px-3 py-2">
+              <p className="text-xs text-slate-400">ROOT</p>
+              <p className="font-mono text-xs break-all">{tree.root}</p>
+            </div>
+          </div>
+
+          {/* Levels */}
+          {levels.map((levelNodes, li) => (
+            <div key={li} className="mb-4">
+              <p className="text-xs text-slate-500 mb-2">
+                Level {li} {li === 0 ? "(leaves)" : ""}
+              </p>
+              <div className="flex gap-2 flex-wrap justify-center">
+                {levelNodes.map((n) => {
+                  const isTampered = tamperedHashes.has(n.hash);
+                  return (
+                    <div
+                      key={n.id}
+                      className={`rounded border px-2 py-1 text-center ${
+                        isTampered
+                          ? "bg-red-900 border-red-600"
+                          : "bg-dark-900 border-slate-600"
+                      }`}
+                    >
+                      <p className="text-[10px] font-mono break-all max-w-[120px]">
+                        {n.hash.slice(0, 16)}...
+                      </p>
+                      {isTampered && (
+                        <p className="text-[10px] text-red-300 font-bold">
+                          TAMPERED
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TamperTest({
+  operations,
+  tamperDeviceId,
+  tamperSequence,
+  tamperResult,
+  onDeviceIdChange,
+  onSequenceChange,
+  onCorrupt,
+  onVerify,
+  integrity,
+}: {
+  operations: OperationSummary[];
+  tamperDeviceId: string;
+  tamperSequence: string;
+  tamperResult: string | null;
+  onDeviceIdChange: (v: string) => void;
+  onSequenceChange: (v: string) => void;
+  onCorrupt: () => void;
+  onVerify: () => void;
+  integrity: IntegrityResult | null;
+}) {
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-semibold text-red-400">Tamper Test</h2>
+      <p className="text-sm text-slate-400">
+        Developer-only: corrupt an operation's ciphertext locally, then verify
+        integrity to see the tamper detected. This is destructive and local-only.
+      </p>
+
+      <div className="bg-dark-800 border border-red-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3 text-red-300">
+          Corrupt Operation
+        </h3>
+        <div className="space-y-2">
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Device ID (hex)
+            </label>
+            <input
+              type="text"
+              value={tamperDeviceId}
+              onChange={(e) => onDeviceIdChange(e.target.value)}
+              placeholder="64 hex chars"
+              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Sequence Number
+            </label>
+            <input
+              type="number"
+              value={tamperSequence}
+              onChange={(e) => onSequenceChange(e.target.value)}
+              placeholder="1"
+              className="w-full bg-dark-900 border border-slate-600 rounded px-3 py-2 text-sm"
+            />
+          </div>
+          <button
+            onClick={onCorrupt}
+            className="w-full bg-red-900 hover:bg-red-800 text-red-200 rounded px-3 py-2 text-sm font-bold"
+          >
+            Corrupt Operation
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3">Verify Integrity</h3>
+        <button
+          onClick={onVerify}
+          className="w-full bg-primary-600 hover:bg-primary-700 text-white rounded px-3 py-2 text-sm"
+        >
+          Run Verify
+        </button>
+        {integrity && (
+          <div className="mt-3">
+            <span
+              className={`inline-block px-2 py-1 rounded text-sm ${
+                integrity.verified
+                  ? "bg-green-900 text-green-200"
+                  : "bg-red-900 text-red-200"
+              }`}
+            >
+              {integrity.status}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {tamperResult && (
+        <div className="bg-dark-800 border border-slate-700 rounded p-4">
+          <h3 className="text-lg font-medium mb-3">Result</h3>
+          <p className="text-sm">{tamperResult}</p>
+        </div>
+      )}
+
+      <div className="bg-dark-800 border border-slate-700 rounded p-4">
+        <h3 className="text-lg font-medium mb-3">Recent Operations</h3>
+        <div className="space-y-1 max-h-60 overflow-y-auto">
+          {operations.map((op) => (
+            <div
+              key={`${op.device_id}-${op.sequence}`}
+              className="text-xs flex justify-between"
+            >
+              <span className="font-mono">{op.sequence}</span>
+              <span className="font-mono text-slate-400">
+                {hex(op.device_id).slice(0, 16)}...
+              </span>
+            </div>
+          ))}
         </div>
       </div>
     </div>

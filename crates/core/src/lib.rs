@@ -519,7 +519,213 @@ impl VeilDbCore {
             bootstrapped,
         })
     }
+
+    /// Rotate the master key.
+    ///
+    /// Generates a new key version, re-derives from the existing master
+    /// secret via Argon2. Historical ciphertexts stay decryptable under
+    /// their original `key_version`.
+    pub fn rotate_key(&mut self) -> Result<u32, CoreError> {
+        let new_version = self.access.rotate_key()?;
+        self.key_version = new_version;
+        Ok(new_version)
+    }
+
+    /// Get the operation DAG for visualization.
+    ///
+    /// Returns a `DagView` containing all operations as nodes and their
+    /// parent edges, suitable for rendering in the frontend.
+    pub fn get_dag(&self) -> Result<DagView, CoreError> {
+        let ops = self.storage.read_all_operations()?;
+
+        let mut nodes = Vec::with_capacity(ops.len());
+        let mut edges = Vec::new();
+
+        for op in &ops {
+            let op_hash = operation_hash(op);
+
+            // Determine signature status by checking the hash.
+            // A simple heuristic: if the operation hash is non-zero
+            // and has a signature, consider it "signed".
+            let signature_status = if op.signature.is_empty() {
+                "unsigned".to_string()
+            } else {
+                "signed".to_string()
+            };
+
+            let clock: Vec<(String, u64)> = op
+                .logical_clock
+                .entries
+                .iter()
+                .map(|(d, c)| (hex_encode(d), *c))
+                .collect();
+
+            nodes.push(DagNode {
+                id: format!(
+                    "{}:{}",
+                    &hex_encode(&op.device_id)[..8],
+                    op.id.sequence
+                ),
+                device_id: op.device_id,
+                sequence: op.id.sequence,
+                hash: op_hash,
+                parents: op.parents.clone(),
+                signature_status,
+                clock,
+            });
+
+            for parent in &op.parents {
+                edges.push(DagEdge {
+                    from: *parent,
+                    to: op_hash,
+                });
+            }
+        }
+
+        Ok(DagView { nodes, edges })
+    }
+
+    /// Get the Merkle tree for visualization.
+    ///
+    /// Returns a `MerkleTreeView` with all nodes (leaves and internal)
+    /// and the root hash, suitable for rendering in the frontend.
+    pub fn get_merkle_tree(&self) -> Result<MerkleTreeView, CoreError> {
+        let ops = self.storage.read_all_operations()?;
+        let hashes: Vec<[u8; 32]> = ops.iter().map(operation_hash).collect();
+        let tree = veildb_integrity::MerkleTree::build(&hashes);
+
+        let mut leaves = Vec::new();
+        for (i, leaf_hash) in tree.leaves().iter().enumerate() {
+            leaves.push(MerkleNodeView {
+                id: format!("leaf-{}", i),
+                hash: *leaf_hash,
+                level: 0,
+                index: i,
+                is_leaf: true,
+            });
+        }
+
+        // Build internal nodes from the tree structure.
+        // The tree has levels 1..=max_level. We can reconstruct
+        // them by re-computing: that's deterministic.
+        let mut internal_nodes = Vec::new();
+        let mut current: Vec<[u8; 32]> = tree.leaves().to_vec();
+        let mut level = 1u32;
+
+        while current.len() > 1 {
+            let mut next = Vec::with_capacity(current.len() / 2);
+            for (i, chunk) in current.chunks(2).enumerate() {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&chunk[0]);
+                if chunk.len() > 1 {
+                    hasher.update(&chunk[1]);
+                } else {
+                    hasher.update(&[0u8; 32]);
+                }
+                let h = *hasher.finalize().as_bytes();
+                next.push(h);
+                internal_nodes.push(MerkleNodeView {
+                    id: format!("node-{}-{}", level, i),
+                    hash: h,
+                    level,
+                    index: i,
+                    is_leaf: false,
+                });
+            }
+            current = next;
+            level += 1;
+        }
+
+        Ok(MerkleTreeView {
+            root: tree.root(),
+            leaves,
+            internal_nodes,
+        })
+    }
+
+    /// Dev-only: corrupt an operation's ciphertext.
+    ///
+    /// Flips bytes in the operation's local ciphertext or hash to
+    /// simulate tampering. Only available in debug builds.
+    #[cfg(debug_assertions)]
+    pub fn dev_corrupt_operation(
+        &mut self,
+        device_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<(), CoreError> {
+        self.storage.corrupt_operation(device_id, sequence)?;
+        Ok(())
+    }
 }
+
+/// A node in the operation DAG visualization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagNode {
+    /// Short display ID (e.g. "a1b2c3d4:1").
+    pub id: String,
+    /// Full device ID.
+    pub device_id: [u8; 32],
+    /// Sequence number within the device.
+    pub sequence: u64,
+    /// Operation hash.
+    pub hash: [u8; 32],
+    /// Parent operation hashes.
+    pub parents: Vec<[u8; 32]>,
+    /// Signature status: "signed" or "unsigned".
+    pub signature_status: String,
+    /// Logical clock entries as (hex_device_id, counter).
+    pub clock: Vec<(String, u64)>,
+}
+
+/// An edge in the operation DAG.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagEdge {
+    /// Hash of the parent operation.
+    pub from: [u8; 32],
+    /// Hash of the child operation.
+    pub to: [u8; 32],
+}
+
+/// The full DAG view for the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagView {
+    /// All operation nodes.
+    pub nodes: Vec<DagNode>,
+    /// All parent-child edges.
+    pub edges: Vec<DagEdge>,
+}
+
+/// A node in the Merkle tree visualization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerkleNodeView {
+    /// Display ID (e.g. "leaf-0", "node-1-0").
+    pub id: String,
+    /// The node's hash.
+    pub hash: [u8; 32],
+    /// Level in the tree (0 = leaves).
+    pub level: u32,
+    /// Index within the level.
+    pub index: usize,
+    /// Whether this is a leaf node.
+    pub is_leaf: bool,
+}
+
+/// The full Merkle tree view for the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MerkleTreeView {
+    /// The root hash.
+    pub root: [u8; 32],
+    /// Leaf nodes (operation hashes).
+    pub leaves: Vec<MerkleNodeView>,
+    /// Internal nodes.
+    pub internal_nodes: Vec<MerkleNodeView>,
+}
+
+/// Helper to encode bytes as hex string.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 
 #[cfg(test)]
 mod tests {

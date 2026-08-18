@@ -16,7 +16,7 @@ pub mod error;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use veildb_crypto::{Key, decrypt, encrypt};
+use veildb_crypto::{Key, KeyRing, decrypt, encrypt};
 use veildb_storage::{LogicalClock, Operation, OperationId, Snapshot, SnapshotId, StorageEngine};
 
 use error::QueryError;
@@ -91,10 +91,8 @@ pub fn index_token(key: &str) -> IndexToken {
 /// time-travel queries.
 pub struct QueryEngine<S: StorageEngine> {
     storage: S,
-    /// The encryption key for index tokens.
-    index_key: Key,
-    /// The current key version.
-    key_version: u32,
+    /// The key ring managing all key versions.
+    key_ring: KeyRing,
 }
 
 impl<S: StorageEngine> QueryEngine<S> {
@@ -102,9 +100,49 @@ impl<S: StorageEngine> QueryEngine<S> {
     pub fn new(storage: S, index_key: Key, key_version: u32) -> Self {
         Self {
             storage,
-            index_key,
-            key_version,
+            key_ring: KeyRing::new(index_key, key_version),
         }
+    }
+
+    /// Get the current active key version.
+    pub fn key_version(&self) -> u32 {
+        self.key_ring.active_version()
+    }
+
+    /// Rotate the index key.
+    pub fn rotate_key(&mut self) -> Result<u32, QueryError> {
+        Ok(self.key_ring.rotate_key()?)
+    }
+
+    /// Decrypt an operation's payload using the key version stored in
+    /// the ciphertext. Never assumes "latest" — always looks up the key
+    /// by the version embedded in the ciphertext.
+    fn decrypt_op_payload(&self, op: &Operation) -> Result<PutOp, QueryError> {
+        // The format is: [32-byte index token][4-byte key_version][12-byte nonce][ciphertext]
+        if op.ciphertext.len() < 32 + 4 + 12 {
+            return Err(QueryError::IndexDecryption(
+                "ciphertext too short".to_string(),
+            ));
+        }
+        let mut version_bytes = [0u8; 4];
+        version_bytes.copy_from_slice(&op.ciphertext[32..36]);
+        let key_version = u32::from_le_bytes(version_bytes);
+
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&op.ciphertext[36..48]);
+
+        let ct = veildb_crypto::Ciphertext {
+            key_version,
+            nonce,
+            data: op.ciphertext[48..].to_vec(),
+        };
+
+        // Look up the key by the version stored in the ciphertext.
+        let key = self.key_ring.key_for_version(key_version)?;
+        let plaintext = decrypt(key, &ct)?;
+        let put: PutOp = postcard::from_bytes(&plaintext)
+            .map_err(|e| QueryError::Serialization(e.to_string()))?;
+        Ok(put)
     }
 
     /// Reconstruct the database state from all operations.
@@ -121,23 +159,7 @@ impl<S: StorageEngine> QueryEngine<S> {
         let mut clock = LogicalClock::new();
 
         for op in ops {
-            // The format is: [32-byte index token][12-byte nonce][ciphertext]
-            if op.ciphertext.len() < 44 {
-                return Err(QueryError::IndexDecryption(
-                    "ciphertext too short".to_string(),
-                ));
-            }
-            let mut nonce = [0u8; 12];
-            nonce.copy_from_slice(&op.ciphertext[32..44]);
-            let ct = veildb_crypto::Ciphertext {
-                key_version: self.key_version,
-                nonce,
-                data: op.ciphertext[44..].to_vec(),
-            };
-            let plaintext = decrypt(&self.index_key, &ct)?;
-            let put: PutOp = postcard::from_bytes(&plaintext)
-                .map_err(|e| QueryError::Serialization(e.to_string()))?;
-
+            let put = self.decrypt_op_payload(op)?;
             state.entries.insert(put.key, put.value);
             clock.merge(&op.logical_clock);
         }
@@ -158,8 +180,8 @@ impl<S: StorageEngine> QueryEngine<S> {
         let mut latest: Option<Operation> = None;
         for op in ops {
             // The index token is stored as the first 32 bytes of the
-            // ciphertext (before the nonce).
-            if op.ciphertext.len() >= 32 + 12 {
+            // ciphertext (before the key version and nonce).
+            if op.ciphertext.len() >= 32 + 4 + 12 {
                 let stored_token = &op.ciphertext[..32];
                 if stored_token == token.0.as_slice() {
                     latest = Some(op);
@@ -168,25 +190,13 @@ impl<S: StorageEngine> QueryEngine<S> {
         }
 
         let op = latest.ok_or_else(|| QueryError::KeyNotFound(key.to_string()))?;
-
-        // Decrypt the payload.
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&op.ciphertext[32..44]);
-        let ct = veildb_crypto::Ciphertext {
-            key_version: self.key_version,
-            nonce,
-            data: op.ciphertext[44..].to_vec(),
-        };
-        let plaintext = decrypt(&self.index_key, &ct)?;
-        let put: PutOp = postcard::from_bytes(&plaintext)
-            .map_err(|e| QueryError::Serialization(e.to_string()))?;
-
+        let put = self.decrypt_op_payload(&op)?;
         Ok(put.value)
     }
 
     /// Build an encrypted index entry for a key-value pair.
     ///
-    /// The format is: [32-byte index token][12-byte nonce][ciphertext]
+    /// The format is: [32-byte index token][4-byte key_version][12-byte nonce][ciphertext]
     pub fn build_indexed_ciphertext(
         &self,
         key: &str,
@@ -197,10 +207,12 @@ impl<S: StorageEngine> QueryEngine<S> {
             value: value.to_vec(),
         };
         let plaintext = postcard::to_allocvec(&put)?;
-        let ct = encrypt(&self.index_key, self.key_version, &plaintext)?;
+        let key_version = self.key_ring.active_version();
+        let ct = encrypt(self.key_ring.active_key(), key_version, &plaintext)?;
 
-        let mut result = Vec::with_capacity(32 + 12 + ct.data.len());
+        let mut result = Vec::with_capacity(32 + 4 + 12 + ct.data.len());
         result.extend_from_slice(&index_token(key).0);
+        result.extend_from_slice(&key_version.to_le_bytes());
         result.extend_from_slice(&ct.nonce);
         result.extend_from_slice(&ct.data);
         Ok(result)
@@ -262,19 +274,8 @@ impl<S: StorageEngine> QueryEngine<S> {
                 // the target clock.
                 if clock.dominates(&op.logical_clock) {
                     // Decrypt and apply.
-                    let mut nonce = [0u8; 12];
-                    if op.ciphertext.len() >= 32 + 12 {
-                        nonce.copy_from_slice(&op.ciphertext[32..44]);
-                        let ct = veildb_crypto::Ciphertext {
-                            key_version: self.key_version,
-                            nonce,
-                            data: op.ciphertext[44..].to_vec(),
-                        };
-                        if let Ok(plaintext) = decrypt(&self.index_key, &ct) {
-                            if let Ok(put) = postcard::from_bytes::<PutOp>(&plaintext) {
-                                state.entries.insert(put.key, put.value);
-                            }
-                        }
+                    if let Ok(put) = self.decrypt_op_payload(op) {
+                        state.entries.insert(put.key, put.value);
                     }
                     clock_so_far.merge(&op.logical_clock);
                 }
@@ -458,5 +459,33 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].id.sequence, 1);
         assert_eq!(log[1].id.sequence, 2);
+    }
+
+    #[test]
+    fn key_rotation_multiversion_reads() {
+        let mut engine = test_engine();
+        assert_eq!(engine.key_version(), 1);
+
+        // Write under v1.
+        let op1 = make_op([1u8; 32], 1, "key1", b"value-v1", &engine);
+        engine.storage.append(op1).unwrap();
+
+        // Rotate to v2.
+        let v2 = engine.rotate_key().unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(engine.key_version(), 2);
+
+        // Write under v2.
+        let op2 = make_op([1u8; 32], 2, "key2", b"value-v2", &engine);
+        engine.storage.append(op2).unwrap();
+
+        // Both v1 and v2 ciphertexts still decrypt correctly.
+        assert_eq!(engine.get("key1").unwrap(), b"value-v1");
+        assert_eq!(engine.get("key2").unwrap(), b"value-v2");
+
+        // Reconstruct state works across versions.
+        let state = engine.reconstruct_state().unwrap();
+        assert_eq!(state.get("key1").unwrap(), &b"value-v1".to_vec());
+        assert_eq!(state.get("key2").unwrap(), &b"value-v2".to_vec());
     }
 }

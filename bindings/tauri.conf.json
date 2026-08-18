@@ -4,19 +4,13 @@
   "version": "0.1.0",
   "identifier": "com.veildb.app",
   "build": {
-    "beforeDevCommand": "",
+    "beforeDevCommand": "npm --prefix frontend run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "",
+    "beforeBuildCommand": "npm --prefix frontend run build",
     "frontendDist": "../frontend/dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "VeilDB",
-        "width": 1200,
-        "height": 800
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

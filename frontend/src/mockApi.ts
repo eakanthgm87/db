@@ -249,6 +249,77 @@ function mockSyncLan(addr: string): any {
   };
 }
 
+function mockRotateKey(): any {
+  requireMock();
+  mock!.keyVersion += 1;
+  return { key_version: mock!.keyVersion };
+}
+
+function mockGetDag(): any {
+  requireMock();
+  const nodes = mock!.operations.map((op) => ({
+    id: `${op.device_id.slice(0, 8)}...:${op.sequence}`,
+    device_id: op.device_id,
+    sequence: op.sequence,
+    hash: op.hash,
+    parents: op.parent_count > 0 ? [mock!.operations[op.sequence - 2]?.hash || ""] : [],
+    signature_status: "SIGNED",
+    clock: op.clock,
+  }));
+  const edges: { from: string; to: string }[] = [];
+  for (let i = 1; i < nodes.length; i++) {
+    edges.push({ from: nodes[i - 1].hash, to: nodes[i].hash });
+  }
+  return { nodes, edges };
+}
+
+function mockGetMerkleTree(): any {
+  requireMock();
+  const leaves = mock!.operations.map((op, i) => ({
+    id: `leaf_${i}`,
+    hash: op.hash,
+    level: 0,
+    index: i,
+    is_leaf: true,
+  }));
+  const internal_nodes: any[] = [];
+  let level = 0;
+  let current = leaves.map((l) => l.hash);
+  while (current.length > 1) {
+    const next: string[] = [];
+    for (let i = 0; i < current.length; i += 2) {
+      const h = randomHex(64);
+      internal_nodes.push({
+        id: `node_${level}_${i / 2}`,
+        hash: h,
+        level: level + 1,
+        index: i / 2,
+        is_leaf: false,
+      });
+      next.push(h);
+    }
+    current = next;
+    level++;
+  }
+  return {
+    root: mock!.merkleRoot,
+    leaves,
+    internal_nodes,
+  };
+}
+
+function mockDevCorruptOperation(deviceId: string, sequence: number): void {
+  requireMock();
+  const op = mock!.operations.find(
+    (o) => o.device_id === deviceId && o.sequence === sequence
+  );
+  if (!op) {
+    throw new Error("Operation not found");
+  }
+  op.hash = randomHex(64);
+  mock!.merkleRoot = randomHex(64);
+}
+
 function requireMock(): void {
   if (!mock) {
     throw new Error("Database not initialized or opened");
@@ -320,6 +391,17 @@ async function call<T>(cmd: string, args: Record<string, unknown>): Promise<ApiR
         return ok(mockSnapshot() as T);
       case "vdb_sync_lan":
         return ok(mockSyncLan(args.addr as string) as T);
+      case "vdb_rotate_key":
+        return ok(mockRotateKey() as T);
+      case "vdb_get_dag":
+        return ok(mockGetDag() as T);
+      case "vdb_get_merkle_tree":
+        return ok(mockGetMerkleTree() as T);
+      case "vdb_dev_corrupt_operation":
+        return ok(mockDevCorruptOperation(
+          args.device_id as string,
+          args.sequence as number
+        ) as T);
       default:
         return err(`Unknown command: ${cmd}`) as ApiResult<T>;
     }
@@ -350,4 +432,9 @@ export const api = {
   restore: (archive: string) => call<any>("vdb_restore", { archive }),
   snapshot: () => call<number>("vdb_snapshot", {}),
   syncLan: (addr: string) => call<any>("vdb_sync_lan", { addr }),
+  rotateKey: () => call<any>("vdb_rotate_key", {}),
+  getDag: () => call<any>("vdb_get_dag", {}),
+  getMerkleTree: () => call<any>("vdb_get_merkle_tree", {}),
+  devCorruptOperation: (deviceId: string, sequence: number) =>
+    call<void>("vdb_dev_corrupt_operation", { device_id: deviceId, sequence }),
 };

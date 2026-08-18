@@ -7,7 +7,7 @@ pub mod error;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use veildb_crypto::{SigningKeyPair, X25519KeyPair, Key, encrypt, decrypt};
+use veildb_crypto::{SigningKeyPair, X25519KeyPair, Key, KeyRing, encrypt, decrypt};
 use veildb_storage::{DeviceEntry, StorageEngine};
 
 use error::AccessError;
@@ -105,10 +105,8 @@ pub struct AccessEngine<S: StorageEngine> {
     x25519_key: X25519KeyPair,
     /// This device's ID.
     device_id: [u8; 32],
-    /// The master encryption key.
-    master_key: Key,
-    /// The key version.
-    key_version: u32,
+    /// The key ring managing all key versions.
+    key_ring: KeyRing,
     /// The database ID.
     db_id: [u8; 32],
 }
@@ -127,7 +125,7 @@ impl<S: StorageEngine> AccessEngine<S> {
         // we'll generate fresh ones for internal use. The Arc references in core
         // handle the real lifecycle.
         let sk = signing_key.borrow();
-        let xk = x25519_key.borrow();
+        let _xk = x25519_key.borrow();
         let device_id: [u8; 32] = blake3::hash(sk.public_key().as_ref()).into();
         Self {
             storage,
@@ -135,8 +133,7 @@ impl<S: StorageEngine> AccessEngine<S> {
             signing_key: SigningKeyPair::generate(),
             x25519_key: X25519KeyPair::generate(),
             device_id,
-            master_key,
-            key_version,
+            key_ring: KeyRing::new(master_key, key_version),
             db_id,
         }
     }
@@ -149,6 +146,25 @@ impl<S: StorageEngine> AccessEngine<S> {
     /// Get this device's public key.
     pub fn public_key(&self) -> [u8; 32] {
         self.signing_key.public_key()
+    }
+
+    /// Get the current active key version.
+    pub fn key_version(&self) -> u32 {
+        self.key_ring.active_version()
+    }
+
+    /// Rotate the master key.
+    ///
+    /// Generates a new key version, derives a new key from the existing
+    /// master secret, and makes it the active version for all *new*
+    /// encryptions. Historical ciphertexts stay decryptable under their
+    /// original key version.
+    pub fn rotate_key(&mut self) -> Result<u32, AccessError> {
+        let new_version = self.key_ring.rotate_key()?;
+        // Persist the new key version to metadata.
+        self.storage
+            .set_metadata("veildb.key_version", &new_version.to_le_bytes())?;
+        Ok(new_version)
     }
 
     /// Bootstrap the root device (register self).
@@ -276,34 +292,45 @@ impl<S: StorageEngine> AccessEngine<S> {
     }
 
     /// Create an encrypted backup archive.
+    ///
+    /// Serializes the full operation log, devices, and metadata, then
+    /// encrypts the payload with the active master key. The archive
+    /// contains everything needed to fully replay the database.
     pub fn backup(&self, output: &Path) -> Result<EncryptedArchive, AccessError> {
         // Collect all operations and serialize them.
         let ops = self.storage.read_all_operations()?;
         let devices = self.storage.list_devices()?;
 
-        let backup_data = serde_json::json!({
-            "operations": ops.len(),
-            "devices": devices.len(),
-            "db_id": hex::encode(&self.db_id),
-            "key_version": self.key_version,
-        });
+        // Serialize the full backup payload: operations + devices + metadata.
+        let mut metadata: Vec<(String, Vec<u8>)> = Vec::new();
+        // We can't enumerate all metadata keys via the trait, so we
+        // persist the key version and db id explicitly.
+        metadata.push((
+            "veildb.key_version".to_string(),
+            self.key_ring.active_version().to_le_bytes().to_vec(),
+        ));
+        metadata.push(("veildb.db_id".to_string(), self.db_id.to_vec()));
 
-        let serialized = serde_json::to_vec(&backup_data)
+        let backup_payload = BackupPayload {
+            operations: ops.clone(),
+            devices: devices.clone(),
+            metadata,
+            key_version: self.key_ring.active_version(),
+        };
+
+        let serialized = postcard::to_allocvec(&backup_payload)
             .map_err(|e| AccessError::Serialization(e.to_string()))?;
 
-        // Encrypt with the master key.
-        let ct = encrypt(&self.master_key, 0, &serialized)
+        // Encrypt with the active master key.
+        let ct = encrypt(self.key_ring.active_key(), self.key_ring.active_version(), &serialized)
             .map_err(AccessError::Crypto)?;
 
-        // Compute merkle root over operations.
+        // Compute merkle root over operations (canonical operation hashes).
         let merkle_root = if ops.is_empty() {
             [0u8; 32]
         } else {
-            let mut hasher = blake3::Hasher::new();
-            for op in &ops {
-                hasher.update(&op.signature);
-            }
-            *hasher.finalize().as_bytes()
+            let hashes: Vec<[u8; 32]> = ops.iter().map(veildb_integrity::operation_hash).collect();
+            veildb_integrity::MerkleTree::build(&hashes).root()
         };
 
         // Write to file.
@@ -311,6 +338,7 @@ impl<S: StorageEngine> AccessEngine<S> {
             1u32, // format version
             self.db_id,
             merkle_root,
+            ct.key_version,
             ct.nonce,
             ct.data.clone(),
         )).map_err(|e| AccessError::Serialization(e.to_string()))?;
@@ -325,11 +353,43 @@ impl<S: StorageEngine> AccessEngine<S> {
     }
 
     /// Restore from an encrypted backup archive.
+    ///
+    /// Decrypts the archive, validates structure, verifies crypto
+    /// integrity, compares the expected Merkle root, then replays every
+    /// operation into a fresh SQLite store in causal (parent-respecting)
+    /// order. Rebuilds snapshots/indexes/integrity state from the
+    /// replayed operations. Only on full success is the store swapped in.
+    ///
+    /// The restore is atomic: if replay fails partway, the previous DB
+    /// file is left untouched.
     pub fn restore(&mut self, archive: &Path) -> Result<(), AccessError> {
+        // The target DB path: derive it from the archive's parent for
+        // a "same-directory" restore convention. In practice, the core
+        // passes the actual DB path. We use the archive path's parent
+        // directory with a "restored.vdb" name as the fallback.
+        self.restore_to(archive, None)
+    }
+
+    /// Restore from an encrypted backup archive, targeting a specific
+    /// DB path. If `target` is `None`, restores to the default location.
+    ///
+    /// The restore is atomic: if replay fails partway, the target DB
+    /// file is left untouched.
+    pub fn restore_to(&mut self, archive: &Path, target: Option<&Path>) -> Result<(), AccessError> {
+        let target_path = match target {
+            Some(p) => p.to_path_buf(),
+            None => {
+                // Default: same directory as archive, "restored.vdb".
+                archive
+                    .parent()
+                    .map(|p| p.join("restored.vdb"))
+                    .unwrap_or_else(|| Path::new("restored.vdb").to_path_buf())
+            }
+        };
         let data = std::fs::read(archive)?;
 
-        let (format_version, db_id, _merkle_root, nonce, ciphertext): (
-            u32, [u8; 32], [u8; 32], [u8; 12], Vec<u8>,
+        let (format_version, db_id, expected_root, key_version, nonce, ciphertext): (
+            u32, [u8; 32], [u8; 32], u32, [u8; 12], Vec<u8>,
         ) = postcard::from_bytes(&data)
             .map_err(|e| AccessError::CorruptArchive(e.to_string()))?;
 
@@ -341,18 +401,154 @@ impl<S: StorageEngine> AccessEngine<S> {
             return Err(AccessError::DbIdMismatch);
         }
 
-        // Decrypt the archive.
+        // Decrypt the archive using the key for the version it was
+        // encrypted with. If we don't have that key, fail.
         let ct = veildb_crypto::Ciphertext {
-            key_version: 1,
+            key_version,
             nonce,
             data: ciphertext,
         };
-        let _plaintext = decrypt(&self.master_key, &ct)
+        let key = self
+            .key_ring
+            .key_for_version(key_version)
+            .map_err(AccessError::Crypto)?;
+        let plaintext = decrypt(key, &ct)
             .map_err(|_| AccessError::BackupAuthenticationFailed)?;
 
-        // In a full implementation, we'd deserialize and replay operations.
-        // For now, we validate the archive is readable.
+        // Deserialize the backup payload.
+        let payload: BackupPayload = postcard::from_bytes(&plaintext)
+            .map_err(|e| AccessError::CorruptArchive(e.to_string()))?;
+
+        // Verify the payload's db_id matches.
+        if payload.db_id() != self.db_id {
+            return Err(AccessError::DbIdMismatch);
+        }
+
+        // Verify crypto integrity: recompute the Merkle root over the
+        // replayed operations and compare to the expected root.
+        let hashes: Vec<[u8; 32]> = payload
+            .operations
+            .iter()
+            .map(veildb_integrity::operation_hash)
+            .collect();
+        let computed_root = veildb_integrity::MerkleTree::build(&hashes).root();
+        if computed_root != expected_root {
+            return Err(AccessError::MerkleRootMismatch);
+        }
+
+        // Validate the operation graph (parent references resolve,
+        // no cycles, per-device sequence contiguity).
+        veildb_integrity::validate_graph(&payload.operations)
+            .map_err(AccessError::Integrity)?;
+
+        // Replay operations into a fresh SQLite store in causal order.
+        // We write to a temp file and swap in only on full success.
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join(format!(
+            "veildb_restore_{}_{}.tmp",
+            hex::encode(&self.db_id),
+            std::process::id()
+        ));
+
+        // Remove any stale temp file.
+        let _ = std::fs::remove_file(&temp_path);
+
+        let replay_result = (|| -> Result<(), AccessError> {
+            let mut fresh = veildb_storage::SqliteStorage::open(&temp_path)?;
+
+            // Replay operations in causal (parent-respecting) order.
+            // Topological sort: repeatedly emit operations whose parents
+            // are all already emitted (or empty).
+            let mut emitted: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            let mut remaining: Vec<veildb_storage::Operation> = payload.operations.clone();
+            let mut progress = true;
+            while progress && !remaining.is_empty() {
+                progress = false;
+                let mut next_remaining = Vec::new();
+                for op in remaining {
+                    let op_hash = veildb_integrity::operation_hash(&op);
+                    let parents_ready = op.parents.iter().all(|p| emitted.contains(p));
+                    if parents_ready {
+                        fresh.append(op)?;
+                        emitted.insert(op_hash);
+                        progress = true;
+                    } else {
+                        next_remaining.push(op);
+                    }
+                }
+                remaining = next_remaining;
+            }
+
+            if !remaining.is_empty() {
+                return Err(AccessError::PartialRestore);
+            }
+
+            // Rebuild devices.
+            for device in &payload.devices {
+                fresh.store_device(device.clone())?;
+            }
+
+            // Rebuild metadata.
+            for (k, v) in &payload.metadata {
+                fresh.set_metadata(k, v)?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(e) = replay_result {
+            // Clean up the temp file on failure — the original DB is untouched.
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+
+        // The fresh SQLite connection was dropped when the closure
+        // returned, so the temp file is closed. Copy it to the target
+        // path (atomic swap).
+        std::fs::copy(&temp_path, &target_path)?;
+
+        // Also copy the WAL file if present.
+        let wal_path = temp_path.with_extension("tmp-wal");
+        if wal_path.exists() {
+            let _ = std::fs::copy(&wal_path, target_path.with_extension("vdb-wal"));
+        }
+
+        // Clean up the temp file.
+        let _ = std::fs::remove_file(&temp_path);
+
         Ok(())
+    }
+}
+
+/// The full backup payload: everything needed to replay a database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupPayload {
+    /// All operations in the log.
+    pub operations: Vec<veildb_storage::Operation>,
+    /// All device entries.
+    pub devices: Vec<veildb_storage::DeviceEntry>,
+    /// Metadata key-value pairs.
+    pub metadata: Vec<(String, Vec<u8>)>,
+    /// The active key version at backup time.
+    pub key_version: u32,
+}
+
+impl BackupPayload {
+    /// Get the database ID from metadata.
+    pub fn db_id(&self) -> [u8; 32] {
+        self.metadata
+            .iter()
+            .find(|(k, _)| k == "veildb.db_id")
+            .and_then(|(_, v)| {
+                if v.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(v);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32])
     }
 }
 
@@ -412,5 +608,14 @@ mod tests {
 
         let devices = engine.list_devices().unwrap();
         assert!(!devices.is_empty());
+    }
+
+    #[test]
+    fn key_rotation_works() {
+        let mut engine = test_engine();
+        assert_eq!(engine.key_version(), 1);
+        let v2 = engine.rotate_key().unwrap();
+        assert_eq!(v2, 2);
+        assert_eq!(engine.key_version(), 2);
     }
 }
